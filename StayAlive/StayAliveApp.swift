@@ -39,6 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Double-click must show something immediately
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             controller.showPanel()
+            // Kill SwiftUI Settings/EmptyView ghost window (only glass NSPanel should remain)
+            for w in NSApp.windows where !(w is NSPanel) {
+                w.orderOut(nil)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            for w in NSApp.windows where !(w is NSPanel) {
+                w.orderOut(nil)
+            }
         }
     }
 
