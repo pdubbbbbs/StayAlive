@@ -178,14 +178,16 @@ final class GlassStack: NSView {
 
 final class ClearHostingView<Content: View>: NSHostingView<Content> {
     override var isOpaque: Bool { false }
-    override init(rootView: Content) {
+
+    required init(rootView: Content) {
         super.init(rootView: rootView)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.isOpaque = false
     }
+
     @available(*, unavailable)
-    required init(coder: NSCoder) { fatalError() }
+    required init?(coder: NSCoder) { fatalError() }
 }
 
 // MARK: - Engine
