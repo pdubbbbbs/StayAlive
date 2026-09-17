@@ -188,6 +188,8 @@ final class StayAliveEngine: ObservableObject {
     @Published var isCharging: Bool = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
     @Published var activeTriggerReason: String?
+    /// True only when awake state is owned by automation triggers (not manual/restore).
+    private var awakeHeldByTrigger: Bool = false
     @Published var wifiSSID: String?
 
     // Settings
@@ -288,7 +290,10 @@ final class StayAliveEngine: ObservableObject {
                 }
             }
             if defaults.bool(forKey: Key.isOn) {
-                setOn(true, reason: "Restored session", userInitiated: false)
+                // userInitiated false but NOT a trigger — restores assertions without auto-off ownership
+                setOn(true, reason: nil, userInitiated: false)
+                activeTriggerReason = "Restored session"
+                awakeHeldByTrigger = false
             }
         }
         applyLoginItem()
@@ -328,11 +333,19 @@ final class StayAliveEngine: ObservableObject {
             if ok {
                 isOn = true
                 activeTriggerReason = reason
+                // Only automation paths pass a reason AND expect auto-off when conditions clear.
+                // Manual toggle / restore must not be cleared by evaluateTriggers().
+                if !userInitiated, let reason, reason != "Restored session" {
+                    awakeHeldByTrigger = true
+                } else if userInitiated {
+                    awakeHeldByTrigger = false
+                }
                 defaults.set(true, forKey: Key.isOn)
                 lastFailure = nil
                 scheduleTimer()
             } else {
                 isOn = false
+                awakeHeldByTrigger = false
                 defaults.set(false, forKey: Key.isOn)
                 notify(title: "Stay Alive failed", body: assertion.lastError ?? "Could not create power assertion")
             }
@@ -341,6 +354,7 @@ final class StayAliveEngine: ObservableObject {
             isOn = false
             endDate = nil
             activeTriggerReason = nil
+            awakeHeldByTrigger = false
             defaults.set(false, forKey: Key.isOn)
             defaults.removeObject(forKey: Key.endDate)
             timer?.invalidate()
@@ -699,22 +713,25 @@ final class StayAliveEngine: ObservableObject {
         if !reasons.isEmpty {
             let joined = reasons.joined(separator: " · ")
             if !isOn {
-                // Use indefinite for auto triggers unless user has a preset they want — keep duration as-is but don't set end if trigger
+                // Keep user duration preference but don't start a short timer for auto triggers
                 let previousDuration = duration
-                // Don't overwrite end date with short timer for triggers — force indefinite while triggered
                 duration = .indefinite
                 setOn(true, reason: joined, userInitiated: false)
                 duration = previousDuration
+                awakeHeldByTrigger = true
                 activeTriggerReason = joined
             } else {
                 activeTriggerReason = joined
+                // If user manually turned on, don't flip ownership to trigger-only
+                // (keeps manual session alive when trigger conditions later clear)
             }
-        } else if let activeTriggerReason, !activeTriggerReason.isEmpty {
-            // Was on due to trigger; conditions cleared
+        } else if awakeHeldByTrigger {
+            // Automation conditions cleared — only then auto-disable
             if isOn {
                 setOn(false, reason: nil, userInitiated: false)
             }
-            self.activeTriggerReason = nil
+            awakeHeldByTrigger = false
+            activeTriggerReason = nil
         }
     }
 
