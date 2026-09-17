@@ -1581,7 +1581,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     private static func makeIcon(active: Bool) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { _ in
-            let color = active ? NSColor.systemTeal : NSColor.secondaryLabelColor
+            let color = active ? NSColor.systemRed : NSColor.secondaryLabelColor
             color.setStroke()
             let path = NSBezierPath()
             path.move(to: NSPoint(x: 1, y: 9))
@@ -1605,9 +1605,10 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 // MARK: - Theme (no brown / no coffee)
 
 enum SATheme {
-    static let accent = Color.teal
-    static let accentNS = NSColor.systemTeal
-    static let on = Color.teal
+    /// Stay Alive = heartbeat red (not teal/green).
+    static let accent = Color.red
+    static let accentNS = NSColor.systemRed
+    static let on = Color.red
     static let textSecondary = Color.secondary
 }
 
@@ -1629,7 +1630,7 @@ struct PanelRootView: View {
                         get: { 1.0 - engine.panelOpacity },
                         set: { engine.panelOpacity = 1.0 - $0 }
                     ), in: 0...1, step: 0.05)
-                    .tint(.teal)
+                    .tint(.red)
                     Text(glassLabel)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -1642,7 +1643,7 @@ struct PanelRootView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
-                        .tint(.teal)
+                        .tint(.red)
                     Text("\(Int((engine.uiZoom * 100).rounded()))%")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -1657,7 +1658,7 @@ struct PanelRootView: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .tint(.teal)
+                    .tint(.red)
 
                     Button {
                         NotificationCenter.default.post(name: .stayAliveOpenSettings, object: nil)
@@ -1691,12 +1692,12 @@ struct ContentView: View {
         VStack(spacing: 16) {
             ZStack {
                 Circle()
-                    .strokeBorder(engine.isOn ? Color.teal.opacity(0.8) : Color.white.opacity(0.2), lineWidth: 2)
+                    .strokeBorder(engine.isOn ? Color.red.opacity(0.9) : Color.white.opacity(0.2), lineWidth: 2)
                     .background(Circle().fill(Color.black.opacity(0.25)))
                     .frame(width: 84, height: 84)
                 Image(systemName: engine.isOn ? "heart.fill" : "heart")
                     .font(.system(size: 34, weight: .semibold))
-                    .foregroundStyle(engine.isOn ? Color.teal : Color.secondary)
+                    .foregroundStyle(engine.isOn ? Color.red : Color.secondary)
             }
 
             Text("Stay Alive")
@@ -1705,7 +1706,7 @@ struct ContentView: View {
 
             Text(engine.statusLine)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(engine.isOn ? Color.teal : Color.secondary)
+                .foregroundStyle(engine.isOn ? Color.red : Color.secondary)
                 .multilineTextAlignment(.center)
 
             Toggle(isOn: Binding(
@@ -1718,7 +1719,7 @@ struct ContentView: View {
             }
             .toggleStyle(.switch)
             .controlSize(.large)
-            .tint(.teal)
+            .tint(.red)
 
             Picker("Mode", selection: Binding(
                 get: { engine.mode },
@@ -1805,7 +1806,7 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("General").font(.headline).foregroundStyle(.teal)
+                Text("General").font(.headline).foregroundStyle(.red)
                 Toggle("Launch at login", isOn: $engine.launchAtLogin)
                 Toggle("Restore awake state on launch", isOn: $engine.restoreOnLaunch)
                 Toggle("Global hotkey ⌃⌥⌘S", isOn: $engine.hotkeyEnabled)
@@ -1823,7 +1824,7 @@ struct SettingsView: View {
                         get: { 1.0 - engine.panelOpacity },
                         set: { engine.panelOpacity = 1.0 - $0 }
                     ), in: 0...1, step: 0.05)
-                    .tint(.teal)
+                    .tint(.red)
                     Text("Right = more desktop visible through the panel. Left = solid.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -1838,24 +1839,24 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
-                        .tint(.teal)
+                        .tint(.red)
                     Text("⌘+ zoom in · ⌘- zoom out · ⌘0 actual size")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Session lock").font(.headline).foregroundStyle(.teal)
+                Text("Session lock").font(.headline).foregroundStyle(.red)
                 Toggle("Prevent screen lock & idle logout", isOn: $engine.preventScreenLock)
                 Toggle("Heartbeat: reset idle timers", isOn: $engine.simulateActivity)
 
-                Text("Safeguards").font(.headline).foregroundStyle(.teal)
+                Text("Safeguards").font(.headline).foregroundStyle(.red)
                 Toggle("Disable when battery is low", isOn: $engine.disableOnBatteryLow)
                 if engine.disableOnBatteryLow {
                     Stepper("Threshold: \(engine.batteryThreshold)%", value: $engine.batteryThreshold, in: 5...50, step: 5)
                 }
                 Toggle("Disable under serious/critical thermal pressure", isOn: $engine.disableOnThermal)
 
-                Text("Automation").font(.headline).foregroundStyle(.teal)
+                Text("Automation").font(.headline).foregroundStyle(.red)
                 Toggle("While processes are running", isOn: $engine.processTriggerEnabled)
                 TextField("Process names", text: $engine.processNamesCSV)
                     .textFieldStyle(.roundedBorder)
@@ -1869,8 +1870,8 @@ struct SettingsView: View {
                 Button("Request calendar access") { engine.requestCalendarAccess() }
                     .disabled(!engine.calendarTriggerEnabled)
 
-                Text("About").font(.headline).foregroundStyle(.teal)
-                LabeledContent("Version", value: "2.6")
+                Text("About").font(.headline).foregroundStyle(.red)
+                LabeledContent("Version", value: "2.7")
                 LabeledContent("Author", value: "Philip S. Wright")
                 LabeledContent("License", value: "MIT")
                 Link("github.com/pdubbbbbs/StayAlive", destination: URL(string: "https://github.com/pdubbbbbs/StayAlive")!)
@@ -1880,7 +1881,7 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .preferredColorScheme(.dark)
-        .tint(.teal)
+        .tint(.red)
     }
 
     private var glassLabel: String {
