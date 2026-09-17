@@ -120,21 +120,27 @@ enum SelfTest {
     }
 }
 
-// MARK: - Real glass stack (this is what other apps do)
+// MARK: - Real glass stack (slider MUST visibly change this)
 
-/// Layer order (bottom → top):
-/// 1. NSVisualEffectView (.behindWindow)  ← desktop shows through
-/// 2. fillView (black, alpha = solidity)  ← slider controls THIS
-/// 3. content (clear hosting)            ← controls only
+/// Bottom → top:
+/// 1) NSVisualEffectView (.behindWindow) — desktop bleeds through
+/// 2) clear SwiftUI host — controls
+/// 3) PassThroughFill (black) — slider sets alphaValue; hits pass through
+final class PassThroughFill: NSView {
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil } // clicks go to controls under us
+}
+
 final class GlassStack: NSView {
     let effectView = NSVisualEffectView()
-    let fillView = NSView()
+    let fillView = PassThroughFill()
     private var contentHost: NSView?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
 
         effectView.frame = bounds
         effectView.autoresizingMask = [.width, .height]
@@ -147,20 +153,22 @@ final class GlassStack: NSView {
         effectView.layer?.masksToBounds = true
         addSubview(effectView)
 
+        // content added later via setContent (middle)
+
         fillView.frame = bounds
         fillView.autoresizingMask = [.width, .height]
         fillView.wantsLayer = true
         fillView.layer?.backgroundColor = NSColor.black.cgColor
         fillView.layer?.cornerRadius = 16
         fillView.layer?.masksToBounds = true
-        fillView.alphaValue = 0.2
-        // Do not steal clicks
+        fillView.alphaValue = 0.15
+        // TOP of z-order so alpha changes are always visible over UI
         addSubview(fillView)
 
         layer?.cornerRadius = 16
         layer?.masksToBounds = true
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -171,17 +179,24 @@ final class GlassStack: NSView {
         view.autoresizingMask = [.width, .height]
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
-        addSubview(view)
+        view.layer?.isOpaque = false
+        // Insert UNDER the fill so dimming covers content too (visible proof)
+        addSubview(view, positioned: .below, relativeTo: fillView)
         contentHost = view
     }
 
-    /// 0 = full glass (desktop visible), 1 = solid black fill
+    /// 0 = no dim (max glass), 1 = full black veil (solid look)
     func setFillOpacity(_ value: CGFloat) {
         let v = min(1, max(0, value))
         fillView.alphaValue = v
-        // Keep effect alive
         effectView.state = .active
         effectView.blendingMode = .behindWindow
+        effectView.material = .hudWindow
+        // Force display
+        fillView.needsDisplay = true
+        effectView.needsDisplay = true
+        needsDisplay = true
+        print("[StayAlive glass] fillView.alphaValue = \(v)")
     }
 }
 
@@ -197,6 +212,12 @@ final class ClearHostingView<Content: View>: NSHostingView<Content> {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.isOpaque = false
+    }
 }
 
 // MARK: - Engine
@@ -525,11 +546,17 @@ final class AppController: NSObject, NSWindowDelegate {
     }
 
     private func applyGlass() {
-        // THIS is the slider effect — fillView.alphaValue
-        stack?.setFillOpacity(CGFloat(engine.solidFill))
+        let v = CGFloat(engine.solidFill)
+        guard let stack else {
+            print("[StayAlive glass] applyGlass skipped — no stack yet")
+            return
+        }
+        stack.setFillOpacity(v)
+        // Ensure veil stays on top of SwiftUI host
+        stack.addSubview(stack.fillView, positioned: .above, relativeTo: nil)
         panel?.isOpaque = false
         panel?.backgroundColor = .clear
-        panel?.alphaValue = 1.0 // never grey the whole window
+        panel?.alphaValue = 1.0
     }
 
     private func positionPanel() {
@@ -701,30 +728,41 @@ struct RootView: View {
             }
             .pickerStyle(.menu)
 
-            // GLASS SLIDER — right = more desktop
+            // GLASS SLIDER — right = more desktop (drives fillView.alphaValue on TOP of UI)
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Desktop glass")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.9))
                     Spacer()
                     Text(glassLabel)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(.red)
                 }
                 Slider(
                     value: Binding(
                         get: { 1.0 - engine.solidFill },
-                        set: { engine.solidFill = 1.0 - $0 }
+                        set: { newVal in
+                            engine.solidFill = 1.0 - newVal
+                            // Belt-and-suspenders: notify immediately
+                            NotificationCenter.default.post(name: .glassChanged, object: engine.solidFill)
+                        }
                     ),
                     in: 0...1,
-                    step: 0.05
+                    step: 0.02
                 )
                 .tint(.red)
-                Text("Drag right to see your desktop through this panel.")
+                .controlSize(.large)
+                Text("Right = clear glass (desktop). Left = solid black veil.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.7))
             }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.black.opacity(0.35))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15)))
+            )
             .padding(.top, 4)
 
             Text(engine.assertionText)
