@@ -10,7 +10,7 @@ Local-only. No accounts. No cloud.
 
 **Author:** Philip S. Wright (`pdubbbbbs`)  
 **Bundle ID:** `me.philipwright.StayAlive`  
-**Version:** 2.3  
+**Version:** 2.4  
 **License:** MIT
 
 ---

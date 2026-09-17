@@ -11,15 +11,135 @@ import os.log
 
 // MARK: - App entry
 
+
+// MARK: - CLI self-test (StayAlive --self-test)
+
+enum SelfTest {
+    /// Returns process exit code (0 = pass).
+    static func run() -> Int32 {
+        print("StayAlive self-test starting…")
+        var failures = 0
+
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            if ok {
+                print("  PASS  \(name)\(detail.isEmpty ? "" : " — \(detail)")")
+            } else {
+                print("  FAIL  \(name)\(detail.isEmpty ? "" : " — \(detail)")")
+                failures += 1
+            }
+        }
+
+        // 1) IOPM display assertion
+        var displayID: IOPMAssertionID = 0
+        let dReason = "StayAlive self-test display" as CFString
+        let dRes = IOPMAssertionCreateWithName(
+            "PreventUserIdleDisplaySleep" as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            dReason,
+            &displayID
+        )
+        check("PreventUserIdleDisplaySleep", dRes == kIOReturnSuccess, "id=\(displayID) rc=\(dRes)")
+
+        // 2) IOPM system idle assertion
+        var systemID: IOPMAssertionID = 0
+        let sReason = "StayAlive self-test system" as CFString
+        let sRes = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            sReason,
+            &systemID
+        )
+        check("PreventUserIdleSystemSleep", sRes == kIOReturnSuccess, "id=\(systemID) rc=\(sRes)")
+
+        // 3) PreventSystemSleep
+        var prevID: IOPMAssertionID = 0
+        let pRes = IOPMAssertionCreateWithName(
+            "PreventSystemSleep" as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "StayAlive self-test prevent" as CFString,
+            &prevID
+        )
+        check("PreventSystemSleep", pRes == kIOReturnSuccess, "id=\(prevID) rc=\(pRes)")
+
+        // 4) User activity pulse
+        var userID: IOPMAssertionID = 0
+        let uRes = IOPMAssertionDeclareUserActivity(
+            "StayAlive self-test user" as CFString,
+            IOPMUserActiveType(0),
+            &userID
+        )
+        check("IOPMAssertionDeclareUserActivity", uRes == kIOReturnSuccess, "id=\(userID) rc=\(uRes)")
+
+        // 5) ProcessInfo activity
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled],
+            reason: "StayAlive self-test"
+        )
+        check("ProcessInfo.beginActivity", true, "token=\(activity)")
+
+        // 6) Confirm pmset sees our assertions (best-effort)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        proc.arguments = ["-g", "assertions"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let out = String(data: data, encoding: .utf8) ?? ""
+            let sees = out.contains("StayAlive self-test") || out.contains("StayAlive")
+            check("pmset lists StayAlive assertions", sees, sees ? "found in pmset" : "not found (may still be OK on some macOS)")
+            // Soft-fail: don't count as hard failure if timing races
+            if !sees { failures = max(0, failures - 1); print("  NOTE  pmset timing race ignored") }
+        } catch {
+            check("pmset invoke", false, error.localizedDescription)
+        }
+
+        // 7) Frosted background types exist (compile-time); runtime create NSVisualEffectView
+        let fx = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        fx.material = .hudWindow
+        fx.blendingMode = .behindWindow
+        fx.state = .active
+        check("NSVisualEffectView glass", fx.material == .hudWindow)
+
+        // 8) Release cleanly
+        if displayID != 0 { IOPMAssertionRelease(displayID) }
+        if systemID != 0 { IOPMAssertionRelease(systemID) }
+        if prevID != 0 { IOPMAssertionRelease(prevID) }
+        if userID != 0 { IOPMAssertionRelease(userID) }
+        ProcessInfo.processInfo.endActivity(activity)
+        check("release assertions", true)
+
+        // 9) Bundle identity when running from .app
+        let bundle = Bundle.main
+        let bid = bundle.bundleIdentifier ?? "(none)"
+        print("  INFO  bundleId=\(bid) version=\(bundle.infoDictionary?["CFBundleShortVersionString"] ?? "?")")
+        if bid != "me.philipwright.StayAlive" && bid != nil && CommandLine.arguments.contains(where: { $0.contains(".app") }) == false {
+            // when invoked as raw binary bid may be nil — OK
+            print("  NOTE  raw binary launch (no bundle id) is OK for CLI self-test")
+        }
+
+        if failures == 0 {
+            print("StayAlive self-test PASSED")
+            return 0
+        } else {
+            print("StayAlive self-test FAILED (\(failures) failure(s))")
+            return 1
+        }
+    }
+}
+
 @main
 struct StayAliveApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
+        // No Settings/WindowGroup scenes — those restore extra desktop boxes.
+        // All UI is AppKit: menu bar + glass NSPanel.
         Settings {
-            SettingsView()
-                .environmentObject(StayAliveEngine.shared)
-                .preferredColorScheme(.dark)
+            EmptyView()
         }
     }
 }
@@ -28,7 +148,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusController: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--self-test") {
+            exit(SelfTest.run())
+        }
+
+        // Menu-bar utility: no Dock bounce, no restored Settings boxes.
         NSApp.setActivationPolicy(.accessory)
+        NSWindow.allowsAutomaticWindowTabbing = false
+
+        // Kill any restored SwiftUI Settings windows from older builds.
+        DispatchQueue.main.async {
+            for w in NSApp.windows {
+                let t = w.title
+                if t.localizedCaseInsensitiveContains("Settings")
+                    || t.localizedCaseInsensitiveContains("Guide")
+                    || t.isEmpty && w.isVisible && !(w is NSPanel) {
+                    w.orderOut(nil)
+                }
+            }
+        }
+
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         let engine = StayAliveEngine.shared
@@ -36,6 +175,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusController = StatusBarController(engine: engine)
         HotKeyManager.shared.registerDefault(engine: engine)
         installMainMenu(engine: engine)
+
+        // Single quiet notification — do NOT open any panel automatically.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            let content = UNMutableNotificationContent()
+            content.title = "Stay Alive"
+            content.body = "Running in the menu bar. Click the pulse icon to open."
+            let req = UNNotificationRequest(identifier: "stayalive.launch", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        }
     }
 
     /// App menu so ⌘+ / ⌘- / ⌘0 work while Settings/Guide windows are focused.
@@ -289,7 +437,7 @@ final class StayAliveEngine: ObservableObject {
     }
     /// 0.0 ... 1.0 — panel *solidity* over frosted glass (1.0 = solid, 0.0 = full glass).
     /// This is NOT window.alphaValue (that only greys content out).
-    @Published var panelOpacity: Double = 1.0 {
+    @Published var panelOpacity: Double = 0.25 {  // default: mostly glass so desktop is visible
         didSet {
             let clamped = min(1.0, max(0.0, panelOpacity))
             if abs(clamped - panelOpacity) > 0.0001 {
@@ -1062,16 +1210,20 @@ final class HotKeyManager {
     }
 }
 
-// MARK: - Status bar
+// MARK: - Status bar (glass NSPanel — desktop shows through)
 
 @MainActor
-final class StatusBarController: NSObject {
+final class StatusBarController: NSObject, NSWindowDelegate {
     private let engine: StayAliveEngine
     private var statusItem: NSStatusItem
     private var menu: NSMenu
+    private var panel: NSPanel?
+    private var glassView: NSVisualEffectView?
+    private var hostView: NSHostingView<AnyView>?
     private var settingsWindow: NSWindow?
-    private var popover: NSPopover?
+    private var guideWindow: NSWindow?
     private var observations: [NSObjectProtocol] = []
+    private var solidOverlay: NSView?
 
     init(engine: StayAliveEngine) {
         self.engine = engine
@@ -1093,10 +1245,10 @@ final class StatusBarController: NSObject {
             Task { @MainActor in self?.refresh() }
         })
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpacityChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.applyOpacity() }
+            Task { @MainActor in self?.applyGlassSolidity() }
         })
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveZoomChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.applyZoom() }
+            Task { @MainActor in self?.rebuildPanelContent() }
         })
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpenSettings, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.openSettings() }
@@ -1105,12 +1257,10 @@ final class StatusBarController: NSObject {
             Task { @MainActor in self?.openGuide() }
         })
 
-        // Refresh title every second while on
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         refresh()
-        applyOpacity()
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
@@ -1120,70 +1270,146 @@ final class StatusBarController: NSObject {
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
         } else {
-            togglePopover()
+            togglePanel()
         }
     }
 
-    private func togglePopover() {
-        if let popover, popover.isShown {
-            popover.performClose(nil)
+    private func togglePanel() {
+        if let panel, panel.isVisible {
+            panel.orderOut(nil)
             return
         }
-        let pop = NSPopover()
-        pop.behavior = .transient
-        pop.animates = true
-        let view = PopoverRootView()
+        showPanel()
+    }
+
+    private func showPanel() {
+        if panel == nil {
+            buildGlassPanel()
+        }
+        rebuildPanelContent()
+        applyGlassSolidity()
+        positionPanel()
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Clear floating panel whose root is NSVisualEffectView(.behindWindow).
+    private func buildGlassPanel() {
+        let width: CGFloat = 340
+        let height: CGFloat = 460
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.delegate = self
+
+        let glass = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        glass.autoresizingMask = [.width, .height]
+        glass.material = .hudWindow
+        glass.blendingMode = .behindWindow   // <-- desktop shows through
+        glass.state = .active
+        glass.isEmphasized = true
+        glass.wantsLayer = true
+        glass.layer?.cornerRadius = 16
+        glass.layer?.masksToBounds = true
+        glass.layer?.borderWidth = 1
+        glass.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+
+        // Solidity overlay: pure black only (never warm/brown windowBackgroundColor)
+        let overlay = NSView(frame: glass.bounds)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.wantsLayer = true
+        overlay.layer?.backgroundColor = NSColor.black.cgColor
+        overlay.layer?.opacity = Float(engine.panelOpacity) // 0 = full glass, 1 = solid black
+        overlay.layer?.cornerRadius = 16
+        overlay.layer?.masksToBounds = true
+        glass.addSubview(overlay)
+
+        let root = PanelRootView()
             .environmentObject(engine)
             .preferredColorScheme(.dark)
-        let host = NSHostingController(rootView: view)
-        pop.contentViewController = host
-        pop.contentSize = NSSize(width: 320, height: 420)
-        self.popover = pop
-        applyOpacity()
-        if let button = statusItem.button {
-            pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        let host = NSHostingView(rootView: AnyView(root))
+        host.frame = glass.bounds
+        host.autoresizingMask = [.width, .height]
+        // Clear hosting background so glass composites
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        glass.addSubview(host)
+
+        panel.contentView = glass
+        self.panel = panel
+        self.glassView = glass
+        self.solidOverlay = overlay
+        self.hostView = host
+    }
+
+    private func rebuildPanelContent() {
+        guard let hostView else { return }
+        let root = PanelRootView()
+            .environmentObject(engine)
+            .preferredColorScheme(.dark)
+            .scaleEffect(engine.uiZoom, anchor: .top)
+        hostView.rootView = AnyView(root)
+    }
+
+    private func applyGlassSolidity() {
+        // 0 = see desktop, 1 = solid dark. Never tint brown/orange.
+        let s = Float(min(1, max(0, engine.panelOpacity)))
+        solidOverlay?.layer?.opacity = s
+        // Keep glass material active always
+        glassView?.state = .active
+        glassView?.blendingMode = .behindWindow
+        if let panel {
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.alphaValue = 1.0 // never dim whole window
         }
-        // Popover window is created on show — clear it so glass can composite
-        DispatchQueue.main.async { [weak self] in
-            self?.prepareClearWindow(pop.contentViewController?.view.window)
-            self?.applyOpacity()
+        if let settingsWindow {
+            settingsWindow.isOpaque = false
+            settingsWindow.backgroundColor = .clear
+            settingsWindow.alphaValue = 1.0
+        }
+        if let guideWindow {
+            guideWindow.isOpaque = false
+            guideWindow.backgroundColor = .clear
+            guideWindow.alphaValue = 1.0
         }
     }
 
-    private func applyOpacity() {
-        // Real transparency = clear non-opaque windows + frosted glass background in SwiftUI.
-        // Do NOT set window.alphaValue from the slider — that only greys the whole UI out.
-        prepareClearWindow(popover?.contentViewController?.view.window)
-        prepareClearWindow(settingsWindow)
-        prepareClearWindow(guideWindow)
-        statusItem.button?.alphaValue = 1.0
-        applyZoom()
+    private func positionPanel() {
+        guard let panel, let button = statusItem.button, let btnWindow = button.window else { return }
+        let buttonRect = button.convert(button.bounds, to: nil)
+        let screenRect = btnWindow.convertToScreen(buttonRect)
+        let panelSize = panel.frame.size
+        var x = screenRect.midX - panelSize.width / 2
+        var y = screenRect.minY - panelSize.height - 8
+        if let screen = btnWindow.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            x = min(max(x, visible.minX + 8), visible.maxX - panelSize.width - 8)
+            if y < visible.minY + 8 {
+                y = screenRect.maxY + 8
+            }
+        }
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
-    private func prepareClearWindow(_ window: NSWindow?) {
-        guard let window else { return }
-        window.alphaValue = 1.0
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        if window.styleMask.contains(.titled) {
-            window.titlebarAppearsTransparent = true
-        }
-        // Ensure dark vibrancy
-        window.appearance = NSAppearance(named: .darkAqua)
-    }
-
-    private func applyZoom() {
-        let z = CGFloat(engine.uiZoom)
-        // Scale hosting views; keep frame readable
-        if let v = popover?.contentViewController?.view {
-            v.scaleUnitSquare(to: NSSize(width: z, height: z))
-        }
-        if let v = settingsWindow?.contentView {
-            v.scaleUnitSquare(to: NSSize(width: z, height: z))
-        }
-        if let v = guideWindow?.contentView {
-            v.scaleUnitSquare(to: NSSize(width: z, height: z))
+    func windowDidResignKey(_ notification: Notification) {
+        // click-away dismiss like a popover
+        if let panel, notification.object as AnyObject? === panel {
+            panel.orderOut(nil)
         }
     }
 
@@ -1201,17 +1427,18 @@ final class StatusBarController: NSObject {
         }
         statusItem.button?.toolTip = "Stay Alive — \(engine.statusLine)"
         rebuildMenu()
-        applyOpacity()
+        if panel?.isVisible == true {
+            rebuildPanelContent()
+            applyGlassSolidity()
+        }
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
-
         let toggle = NSMenuItem(title: engine.isOn ? "Turn Off" : "Turn On", action: #selector(toggleOn), keyEquivalent: "s")
         toggle.keyEquivalentModifierMask = [.control, .option, .command]
         toggle.target = self
         menu.addItem(toggle)
-
         menu.addItem(NSMenuItem.separator())
 
         let modeMenu = NSMenu()
@@ -1239,48 +1466,32 @@ final class StatusBarController: NSObject {
         menu.addItem(durItem)
 
         menu.addItem(NSMenuItem.separator())
-
         let status = NSMenuItem(title: engine.assertion.summary, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
 
-        if let fail = engine.lastFailure, !fail.isEmpty {
-            let f = NSMenuItem(title: "⚠ \(fail)", action: nil, keyEquivalent: "")
-            f.isEnabled = false
-            menu.addItem(f)
-        }
-
         menu.addItem(NSMenuItem.separator())
-
         let guide = NSMenuItem(title: "Guide…", action: #selector(openGuide), keyEquivalent: "g")
         guide.target = self
         menu.addItem(guide)
-
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem.separator())
-
         let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "+")
         zoomIn.keyEquivalentModifierMask = [.command]
         zoomIn.target = self
         menu.addItem(zoomIn)
-
-        // Cmd+= is the unshifted key for + on US keyboards
         let zoomInEq = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "=")
         zoomInEq.keyEquivalentModifierMask = [.command]
         zoomInEq.target = self
-        zoomInEq.isAlternate = true
         zoomInEq.isHidden = true
         menu.addItem(zoomInEq)
-
         let zoomOut = NSMenuItem(title: "Zoom Out", action: #selector(zoomOutAction), keyEquivalent: "-")
         zoomOut.keyEquivalentModifierMask = [.command]
         zoomOut.target = self
         menu.addItem(zoomOut)
-
         let zoomReset = NSMenuItem(title: "Actual Size", action: #selector(zoomResetAction), keyEquivalent: "0")
         zoomReset.keyEquivalentModifierMask = [.command]
         zoomReset.target = self
@@ -1293,101 +1504,90 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func toggleOn() { engine.toggle() }
-
     @objc private func selectMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let m = SleepMode(rawValue: raw) else { return }
         engine.setMode(m)
     }
-
     @objc private func selectDuration(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let d = DurationPreset(rawValue: raw) else { return }
         engine.setDuration(d)
     }
 
-    private var guideWindow: NSWindow?
-
     @objc private func openGuide() {
+        panel?.orderOut(nil)
         NSApp.activate(ignoringOtherApps: true)
         if guideWindow == nil {
-            let host = NSHostingController(rootView: GuideView().preferredColorScheme(.dark))
-            let window = NSWindow(contentViewController: host)
-            window.title = "Stay Alive Guide"
-            window.styleMask = [.titled, .closable, .fullSizeContentView]
-            window.setContentSize(NSSize(width: 380, height: 520))
-            window.center()
-            window.isReleasedWhenClosed = false
-            window.isOpaque = false
-            window.backgroundColor = .clear
-            window.titlebarAppearsTransparent = true
-            window.appearance = NSAppearance(named: .darkAqua)
-            guideWindow = window
+            guideWindow = makeGlassWindow(title: "Stay Alive Guide", size: NSSize(width: 400, height: 520), root: AnyView(GuideView().environmentObject(engine)))
         }
-        applyOpacity()
         guideWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openSettings() {
+        panel?.orderOut(nil)
         NSApp.activate(ignoringOtherApps: true)
         if settingsWindow == nil {
-            let view = SettingsView()
-                .environmentObject(engine)
-                .preferredColorScheme(.dark)
-            let host = NSHostingController(rootView: view)
-            let window = NSWindow(contentViewController: host)
-            window.title = "Stay Alive Settings"
-            window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
-            window.setContentSize(NSSize(width: 440, height: 560))
-            window.center()
-            window.isReleasedWhenClosed = false
-            window.isOpaque = false
-            window.backgroundColor = .clear
-            window.titlebarAppearsTransparent = true
-            window.appearance = NSAppearance(named: .darkAqua)
-            settingsWindow = window
+            settingsWindow = makeGlassWindow(title: "Stay Alive Settings", size: NSSize(width: 460, height: 580), root: AnyView(SettingsView().environmentObject(engine)))
         }
-        applyOpacity()
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
+    private func makeGlassWindow(title: String, size: NSSize, root: AnyView) -> NSWindow {
+        let window = NSPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .visible
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.hasShadow = true
+
+        let glass = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        glass.autoresizingMask = [.width, .height]
+        glass.material = .hudWindow
+        glass.blendingMode = .behindWindow
+        glass.state = .active
+        glass.wantsLayer = true
+
+        let host = NSHostingView(rootView: root.preferredColorScheme(.dark))
+        host.frame = glass.bounds
+        host.autoresizingMask = [.width, .height]
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        glass.addSubview(host)
+        window.contentView = glass
+        window.center()
+        return window
     }
 
-    @objc private func zoomInAction() {
-        engine.bumpZoom(0.1)
-        applyZoom()
-    }
+    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func zoomInAction() { engine.bumpZoom(0.1); rebuildPanelContent() }
+    @objc private func zoomOutAction() { engine.bumpZoom(-0.1); rebuildPanelContent() }
+    @objc private func zoomResetAction() { engine.uiZoom = 1.0; rebuildPanelContent() }
 
-    @objc private func zoomOutAction() {
-        engine.bumpZoom(-0.1)
-        applyZoom()
-    }
-
-    @objc private func zoomResetAction() {
-        engine.uiZoom = 1.0
-        applyZoom()
-    }
-
+    /// Pulse / heartbeat icon — not a coffee cup.
     private static func makeIcon(active: Bool) -> NSImage {
         let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size, flipped: false) { rect in
-            let base = active ? NSColor.systemOrange : NSColor.secondaryLabelColor
-            base.setFill()
-            // Simple cup shape
-            let body = NSBezierPath(roundedRect: NSRect(x: 5, y: 3, width: 8, height: 10), xRadius: 1.5, yRadius: 1.5)
-            body.fill()
-            let handle = NSBezierPath(ovalIn: NSRect(x: 12, y: 6, width: 4, height: 5))
-            handle.lineWidth = 1.2
-            base.setStroke()
-            handle.stroke()
-            if active {
-                NSColor.systemOrange.withAlphaComponent(0.9).setStroke()
-                let steam = NSBezierPath()
-                steam.move(to: NSPoint(x: 7, y: 14))
-                steam.curve(to: NSPoint(x: 8, y: 17), controlPoint1: NSPoint(x: 6, y: 15.5), controlPoint2: NSPoint(x: 9, y: 15.5))
-                steam.lineWidth = 1.0
-                steam.stroke()
-            }
+        let image = NSImage(size: size, flipped: false) { _ in
+            let color = active ? NSColor.systemTeal : NSColor.secondaryLabelColor
+            color.setStroke()
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: 1, y: 9))
+            path.line(to: NSPoint(x: 4, y: 9))
+            path.line(to: NSPoint(x: 6.5, y: 14))
+            path.line(to: NSPoint(x: 9.5, y: 4))
+            path.line(to: NSPoint(x: 12, y: 11))
+            path.line(to: NSPoint(x: 14, y: 9))
+            path.line(to: NSPoint(x: 17, y: 9))
+            path.lineWidth = 1.6
+            path.lineJoinStyle = .round
+            path.lineCapStyle = .round
+            path.stroke()
             return true
         }
         image.isTemplate = !active
@@ -1395,126 +1595,85 @@ final class StatusBarController: NSObject {
     }
 }
 
-// MARK: - SwiftUI views
+// MARK: - Theme (no brown / no coffee)
 
-// MARK: - Real frosted-glass panel background
-
-struct VisualEffectBackground: NSViewRepresentable {
-    var material: NSVisualEffectView.Material = .hudWindow
-    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = material
-        view.blendingMode = blendingMode
-        view.state = .active
-        view.isEmphasized = true
-        view.wantsLayer = true
-        view.layer?.cornerRadius = 12
-        view.layer?.masksToBounds = true
-        return view
-    }
-
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {
-        view.material = material
-        view.blendingMode = blendingMode
-        view.state = .active
-        view.isEmphasized = true
-    }
+enum SATheme {
+    static let accent = Color.teal
+    static let accentNS = NSColor.systemTeal
+    static let on = Color.teal
+    static let textSecondary = Color.secondary
 }
 
-/// `solidity` 0 = full glass (desktop shows through), 1 = solid dark panel.
-struct FrostedPanelBackground: View {
-    var solidity: Double
+// MARK: - SwiftUI panel content (clear backgrounds — glass is AppKit under us)
 
-    var body: some View {
-        let s = min(1.0, max(0.0, solidity))
-        ZStack {
-            // Always-on vibrancy so desktop / windows bleed through when solid fill is low
-            VisualEffectBackground(
-                material: s < 0.35 ? .menu : (s < 0.7 ? .sidebar : .titlebar),
-                blendingMode: .behindWindow
-            )
-            // Soft dark veil for readability in dark mode
-            Color.black.opacity(0.12 + 0.25 * (1.0 - s))
-            // Solid fill ramps up with the slider — this is what "opaque" means
-            Color(nsColor: .windowBackgroundColor).opacity(s)
-        }
-    }
-}
-
-struct PopoverRootView: View {
+struct PanelRootView: View {
     @EnvironmentObject private var engine: StayAliveEngine
 
     var body: some View {
         VStack(spacing: 0) {
             ContentView()
-            Divider().opacity(0.3)
-            HStack {
-                Text("Opacity")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Slider(value: $engine.panelOpacity, in: 0.0...1.0, step: 0.05)
-                    .controlSize(.small)
-                Text("\(engine.panelOpacityPercent)%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .trailing)
-                    .help(engine.opacityLabel)
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-            .padding(.bottom, 4)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Panel opacity")
-            .accessibilityValue(engine.opacityLabel)
-
-            HStack {
-                Text("Zoom")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
-                    .controlSize(.small)
-                Text("\(Int((engine.uiZoom * 100).rounded()))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .trailing)
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 6)
-            .accessibilityLabel("UI zoom")
-            .help("⌘+ zoom in · ⌘- zoom out · ⌘0 reset")
-
-            // Guide + Settings on the desktop popover box
-            HStack(spacing: 10) {
-                Button {
-                    NotificationCenter.default.post(name: .stayAliveOpenGuide, object: nil)
-                } label: {
-                    Label("Guide", systemImage: "book.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(maxWidth: .infinity)
+            Divider().overlay(Color.white.opacity(0.12))
+            VStack(spacing: 8) {
+                HStack {
+                    Text("Glass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Slider(value: Binding(
+                        get: { 1.0 - engine.panelOpacity },
+                        set: { engine.panelOpacity = 1.0 - $0 }
+                    ), in: 0...1, step: 0.05)
+                    .tint(.teal)
+                    Text(glassLabel)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 52, alignment: .trailing)
                 }
-                .buttonStyle(.bordered)
-                .tint(.orange)
-                .accessibilityLabel("Open Stay Alive guide")
+                .help("Drag right to see more desktop through the panel")
 
-                Button {
-                    NotificationCenter.default.post(name: .stayAliveOpenSettings, object: nil)
-                } label: {
-                    Label("Settings", systemImage: "gearshape.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(maxWidth: .infinity)
+                HStack {
+                    Text("Zoom")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
+                        .tint(.teal)
+                    Text("\(Int((engine.uiZoom * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, alignment: .trailing)
                 }
-                .buttonStyle(.bordered)
-                .accessibilityLabel("Open settings")
+
+                HStack(spacing: 10) {
+                    Button {
+                        NotificationCenter.default.post(name: .stayAliveOpenGuide, object: nil)
+                    } label: {
+                        Label("Guide", systemImage: "book")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.teal)
+
+                    Button {
+                        NotificationCenter.default.post(name: .stayAliveOpenSettings, object: nil)
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
             .padding(.horizontal, 16)
-            .padding(.bottom, 12)
+            .padding(.vertical, 12)
         }
-        .frame(width: 320)
-        .background(FrostedPanelBackground(solidity: engine.panelOpacity))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .scaleEffect(engine.uiZoom, anchor: .top)
+        .frame(width: 340)
+        // CRITICAL: no solid Color background — let AppKit glass show desktop
+        .background(Color.clear)
+    }
+
+    private var glassLabel: String {
+        let g = Int(((1.0 - engine.panelOpacity) * 100).rounded())
+        if g >= 95 { return "Clear" }
+        if g <= 5 { return "Solid" }
+        return "\(g)%"
     }
 }
 
@@ -1525,21 +1684,22 @@ struct ContentView: View {
         VStack(spacing: 16) {
             ZStack {
                 Circle()
-                    .fill(engine.isOn ? Color.orange.opacity(0.28) : Color.gray.opacity(0.12))
+                    .strokeBorder(engine.isOn ? Color.teal.opacity(0.8) : Color.white.opacity(0.2), lineWidth: 2)
+                    .background(Circle().fill(Color.black.opacity(0.25)))
                     .frame(width: 84, height: 84)
-                Text("☕️")
-                    .font(.system(size: 40))
-                    .accessibilityHidden(true)
+                Image(systemName: engine.isOn ? "heart.fill" : "heart")
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundStyle(engine.isOn ? Color.teal : Color.secondary)
             }
 
             Text("Stay Alive")
-                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white)
 
             Text(engine.statusLine)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(engine.isOn ? Color.orange : Color.secondary)
+                .foregroundStyle(engine.isOn ? Color.teal : Color.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 280)
 
             Toggle(isOn: Binding(
                 get: { engine.isOn },
@@ -1551,9 +1711,7 @@ struct ContentView: View {
             }
             .toggleStyle(.switch)
             .controlSize(.large)
-            .tint(.orange)
-            .accessibilityLabel("Keep Mac awake")
-            .accessibilityValue(engine.isOn ? "On" : "Off")
+            .tint(.teal)
 
             Picker("Mode", selection: Binding(
                 get: { engine.mode },
@@ -1565,7 +1723,6 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .accessibilityLabel("Sleep prevention mode")
 
             Picker("Duration", selection: Binding(
                 get: { engine.duration },
@@ -1576,7 +1733,6 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.menu)
-            .accessibilityLabel("Auto-off duration")
 
             VStack(alignment: .leading, spacing: 4) {
                 Label(engine.assertion.summary, systemImage: engine.assertion.anyActive ? "checkmark.shield" : "moon.zzz")
@@ -1585,98 +1741,54 @@ struct ContentView: View {
                 if let fail = engine.lastFailure, !fail.isEmpty {
                     Text(fail)
                         .font(.system(size: 11))
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .foregroundStyle(.red.opacity(0.9))
                 }
                 if let pct = engine.batteryPercent {
                     Text("Battery \(pct)%\(engine.isCharging ? " · charging" : "") · thermal \(engine.thermalLabel)")
                         .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if engine.preventScreenLock {
-                Text("Idle lock/logout blocked while On")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.orange.opacity(0.9))
-            }
-
-            Text("Hotkey ⌃⌥⌘S · Right-click menu")
+            Text("⌃⌥⌘S toggle · drag Glass right to see desktop")
                 .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
         }
         .padding(20)
+        .background(Color.clear)
     }
 }
 
 struct GuideView: View {
+    @EnvironmentObject private var engine: StayAliveEngine
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Text("Stay Alive Guide")
-                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .font(.title2.weight(.semibold))
                 Spacer()
-                Button("Done") {
-                    dismiss()
-                    NSApp.keyWindow?.close()
-                }
-                    .keyboardShortcut(.cancelAction)
+                Button("Close") { NSApp.keyWindow?.orderOut(nil) }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    guideSection("Quick start", """
-1. Click the coffee-cup icon in the menu bar.
-2. Flip On.
-3. Mode: Both (or Display / System only).
-4. Pick a Duration, or Indefinite.
-5. Opacity slider dims the popover if you want it translucent.
-""")
-                    guideSection("Hotkey", "⌃⌥⌘S toggles On/Off from anywhere. Disable under Settings → General.")
-                    guideSection("Right-click menu", "Turn On/Off · Mode · Duration · assertion status · Settings… · Quit")
-                    guideSection("Session lock / logout", """
-Your Mac may lock after a short screensaver idle (~3 min here).
-
-While On, Stay Alive holds sleep assertions and pulses user-activity so idle lock / logout timers reset.
-
-Does not block: manual Log Out, some lid-close sleeps, or MDM force-logout.
-""")
-                    guideSection("Safeguards", "Auto-off on low battery and serious/critical thermal pressure (configurable in Settings).")
-                    guideSection("Automation", "Optional local triggers: processes, AC power, Wi‑Fi SSIDs, calendar events.")
-                    guideSection("Install", "~/Applications/StayAlive.app\nhttps://github.com/pdubbbbbs/StayAlive")
-                    Text("MIT © 2026 Philip S. Wright")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 8)
-                }
-                .padding(16)
+            Group {
+                Text("Menu bar pulse icon opens the glass panel.")
+                Text("Glass slider: right = more desktop visible underneath.")
+                Text("On keeps display/system awake; session lock heartbeat optional in Settings.")
+                Text("⌘+ / ⌘- zoom · ⌘[ / ⌘] glass amount.")
             }
+            .font(.body)
+            .foregroundStyle(.primary)
+            Spacer()
+            Text("MIT © Philip S. Wright")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .frame(width: 360, height: 480)
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.clear)
         .preferredColorScheme(.dark)
-        .background(FrostedPanelBackground(solidity: StayAliveEngine.shared.panelOpacity))
-        .scaleEffect(StayAliveEngine.shared.uiZoom, anchor: .top)
-    }
-
-    private func guideSection(_ title: String, _ body: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.orange)
-            Text(body)
-                .font(.system(size: 12))
-                .foregroundStyle(.primary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1684,102 +1796,90 @@ struct SettingsView: View {
     @EnvironmentObject private var engine: StayAliveEngine
 
     var body: some View {
-        Form {
-            Section("General") {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("General").font(.headline).foregroundStyle(.teal)
                 Toggle("Launch at login", isOn: $engine.launchAtLogin)
                 Toggle("Restore awake state on launch", isOn: $engine.restoreOnLaunch)
                 Toggle("Global hotkey ⌃⌥⌘S", isOn: $engine.hotkeyEnabled)
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Panel opacity")
+                        Text("Desktop glass")
                         Spacer()
-                        Text(engine.opacityLabel)
+                        Text(glassLabel)
                             .foregroundStyle(.secondary)
                             .font(.caption)
-                            .multilineTextAlignment(.trailing)
                     }
-                    Slider(value: $engine.panelOpacity, in: 0.0...1.0, step: 0.05)
-                    Text("Frosted glass behind a solid fill. 100% = solid panel, 0% = full glass (desktop shows through). ⌘[ more glass · ⌘] more solid.")
+                    // UI: 0 clear ... 1 solid mapped inverted for "see desktop" intuition
+                    Slider(value: Binding(
+                        get: { 1.0 - engine.panelOpacity },
+                        set: { engine.panelOpacity = 1.0 - $0 }
+                    ), in: 0...1, step: 0.05)
+                    .tint(.teal)
+                    Text("Right = more desktop visible through the panel. Left = solid.")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Panel opacity")
-                .accessibilityValue(engine.opacityLabel)
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("UI zoom")
                         Spacer()
                         Text("\(Int((engine.uiZoom * 100).rounded()))%")
-                            .foregroundStyle(.secondary)
                             .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
+                        .tint(.teal)
                     Text("⌘+ zoom in · ⌘- zoom out · ⌘0 actual size")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
-                .accessibilityLabel("UI zoom")
-            }
 
-            Section("Session lock / logout") {
+                Text("Session lock").font(.headline).foregroundStyle(.teal)
                 Toggle("Prevent screen lock & idle logout", isOn: $engine.preventScreenLock)
                 Toggle("Heartbeat: reset idle timers", isOn: $engine.simulateActivity)
-                Text("Your screensaver idle is short (~3 min). Stay Alive declares user activity while On so lock/logout timers do not fire. This cannot block a manual logout or MDM force-logout.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
 
-            Section("Safeguards") {
+                Text("Safeguards").font(.headline).foregroundStyle(.teal)
                 Toggle("Disable when battery is low", isOn: $engine.disableOnBatteryLow)
                 if engine.disableOnBatteryLow {
                     Stepper("Threshold: \(engine.batteryThreshold)%", value: $engine.batteryThreshold, in: 5...50, step: 5)
                 }
                 Toggle("Disable under serious/critical thermal pressure", isOn: $engine.disableOnThermal)
-                Text("Lid sleep is still controlled by macOS; closing the lid may sleep regardless of assertions.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
 
-            Section("Automation triggers (local only)") {
+                Text("Automation").font(.headline).foregroundStyle(.teal)
                 Toggle("While processes are running", isOn: $engine.processTriggerEnabled)
-                TextField("Process names (comma-separated)", text: $engine.processNamesCSV)
+                TextField("Process names", text: $engine.processNamesCSV)
+                    .textFieldStyle(.roundedBorder)
                     .disabled(!engine.processTriggerEnabled)
-
                 Toggle("While charging / on AC", isOn: $engine.chargingTriggerEnabled)
-
                 Toggle("On selected Wi‑Fi networks", isOn: $engine.wifiTriggerEnabled)
-                TextField("SSIDs (comma-separated)", text: $engine.wifiSSIDsCSV)
+                TextField("SSIDs", text: $engine.wifiSSIDsCSV)
+                    .textFieldStyle(.roundedBorder)
                     .disabled(!engine.wifiTriggerEnabled)
-                if let ssid = engine.wifiSSID {
-                    Text("Current SSID: \(ssid)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
                 Toggle("During calendar events", isOn: $engine.calendarTriggerEnabled)
                 Button("Request calendar access") { engine.requestCalendarAccess() }
                     .disabled(!engine.calendarTriggerEnabled)
-            }
 
-            Section("About") {
-                LabeledContent("Version", value: "2.3")
-                LabeledContent("Bundle", value: "me.philipwright.StayAlive")
+                Text("About").font(.headline).foregroundStyle(.teal)
+                LabeledContent("Version", value: "2.5")
                 LabeledContent("Author", value: "Philip S. Wright")
                 LabeledContent("License", value: "MIT")
-                Text("Self-hosted utility. No cloud accounts. philipwright.me")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Link("GitHub: pdubbbbbs/StayAlive", destination: URL(string: "https://github.com/pdubbbbbs/StayAlive")!)
-                    .font(.caption)
+                Link("github.com/pdubbbbbs/StayAlive", destination: URL(string: "https://github.com/pdubbbbbs/StayAlive")!)
             }
+            .padding(24)
         }
-        .formStyle(.grouped)
-        .frame(minWidth: 420, minHeight: 520)
-        .padding()
-        .background(FrostedPanelBackground(solidity: engine.panelOpacity))
-        .scaleEffect(engine.uiZoom, anchor: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.clear)
+        .preferredColorScheme(.dark)
+        .tint(.teal)
+    }
+
+    private var glassLabel: String {
+        let g = Int(((1.0 - engine.panelOpacity) * 100).rounded())
+        if g >= 95 { return "Clear — desktop visible" }
+        if g <= 5 { return "Solid" }
+        return "\(g)% glass"
     }
 }

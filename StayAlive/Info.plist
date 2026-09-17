@@ -21,9 +21,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.3</string>
+	<string>2.5</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>7</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSApplicationCategoryType</key>
@@ -40,5 +40,7 @@
 	<string>Stay Alive can keep your Mac awake during calendar events you choose to match.</string>
 	<key>NSUserNotificationsUsageDescription</key>
 	<string>Stay Alive notifies you when timers end or safeguards disable awake mode.</string>
+	<key>NSQuitAlwaysKeepsWindows</key>
+	<false/>
 </dict>
 </plist>
