@@ -152,17 +152,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(SelfTest.run())
         }
 
-        // Menu-bar utility: no Dock bounce, no restored Settings boxes.
-        NSApp.setActivationPolicy(.accessory)
+        // CRITICAL: double-click from Applications must be visible.
+        // LSUIElement=false + .regular puts Stay Alive in the Dock.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         NSWindow.allowsAutomaticWindowTabbing = false
 
-        // Kill any restored SwiftUI Settings windows from older builds.
+        // Close any leftover Settings/Guide windows from older builds (one panel only).
         DispatchQueue.main.async {
             for w in NSApp.windows {
-                let t = w.title
-                if t.localizedCaseInsensitiveContains("Settings")
-                    || t.localizedCaseInsensitiveContains("Guide")
-                    || t.isEmpty && w.isVisible && !(w is NSPanel) {
+                let title = w.title
+                if title.localizedCaseInsensitiveContains("Settings")
+                    || title.localizedCaseInsensitiveContains("Guide") {
                     w.orderOut(nil)
                 }
             }
@@ -176,11 +177,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         HotKeyManager.shared.registerDefault(engine: engine)
         installMainMenu(engine: engine)
 
-        // Single quiet notification — do NOT open any panel automatically.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+        // Visible proof of launch: open the glass panel once (user sees desktop through it).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.statusController?.openPanelFromLaunch()
             let content = UNMutableNotificationContent()
-            content.title = "Stay Alive"
-            content.body = "Running in the menu bar. Click the pulse icon to open."
+            content.title = "Stay Alive is open"
+            content.body = "Glass panel is on screen. Drag Glass right to see your desktop underneath."
             let req = UNNotificationRequest(identifier: "stayalive.launch", content: content, trigger: nil)
             UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
         }
@@ -1274,6 +1276,11 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         }
     }
 
+    func openPanelFromLaunch() {
+        // Called on double-click / open — always show the glass panel.
+        showPanel()
+    }
+
     private func togglePanel() {
         if let panel, panel.isVisible {
             panel.orderOut(nil)
@@ -1863,7 +1870,7 @@ struct SettingsView: View {
                     .disabled(!engine.calendarTriggerEnabled)
 
                 Text("About").font(.headline).foregroundStyle(.teal)
-                LabeledContent("Version", value: "2.5")
+                LabeledContent("Version", value: "2.6")
                 LabeledContent("Author", value: "Philip S. Wright")
                 LabeledContent("License", value: "MIT")
                 Link("github.com/pdubbbbbs/StayAlive", destination: URL(string: "https://github.com/pdubbbbbs/StayAlive")!)
