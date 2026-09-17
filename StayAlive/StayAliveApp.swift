@@ -911,6 +911,8 @@ final class StayAliveEngine: ObservableObject {
 extension Notification.Name {
     static let stayAliveStateChanged = Notification.Name("stayAliveStateChanged")
     static let stayAliveOpacityChanged = Notification.Name("stayAliveOpacityChanged")
+    static let stayAliveOpenSettings = Notification.Name("stayAliveOpenSettings")
+    static let stayAliveOpenGuide = Notification.Name("stayAliveOpenGuide")
 }
 
 // MARK: - Hotkey (⌃⌥⌘S)
@@ -992,6 +994,9 @@ final class StatusBarController: NSObject {
         })
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpacityChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.applyOpacity() }
+        })
+        observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpenSettings, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.openSettings() }
         })
 
         // Refresh title every second while on
@@ -1106,6 +1111,10 @@ final class StatusBarController: NSObject {
 
         menu.addItem(NSMenuItem.separator())
 
+        let guide = NSMenuItem(title: "Guide…", action: #selector(openGuide), keyEquivalent: "g")
+        guide.target = self
+        menu.addItem(guide)
+
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -1126,6 +1135,24 @@ final class StatusBarController: NSObject {
     @objc private func selectDuration(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let d = DurationPreset(rawValue: raw) else { return }
         engine.setDuration(d)
+    }
+
+    private var guideWindow: NSWindow?
+
+    @objc private func openGuide() {
+        NSApp.activate(ignoringOtherApps: true)
+        if guideWindow == nil {
+            let host = NSHostingController(rootView: GuideView().preferredColorScheme(.dark))
+            let window = NSWindow(contentViewController: host)
+            window.title = "Stay Alive Guide"
+            window.styleMask = [.titled, .closable]
+            window.setContentSize(NSSize(width: 380, height: 520))
+            window.center()
+            window.isReleasedWhenClosed = false
+            guideWindow = window
+        }
+        guideWindow?.alphaValue = CGFloat(engine.panelOpacity)
+        guideWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openSettings() {
@@ -1182,6 +1209,7 @@ final class StatusBarController: NSObject {
 
 struct PopoverRootView: View {
     @EnvironmentObject private var engine: StayAliveEngine
+    @State private var showGuide = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1199,13 +1227,43 @@ struct PopoverRootView: View {
                     .frame(width: 36, alignment: .trailing)
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Panel opacity")
+
+            HStack(spacing: 10) {
+                Button {
+                    showGuide = true
+                } label: {
+                    Label("Guide", systemImage: "book.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .accessibilityLabel("Open Stay Alive guide")
+
+                Button {
+                    NotificationCenter.default.post(name: .stayAliveOpenSettings, object: nil)
+                } label: {
+                    Label("Settings", systemImage: "gearshape.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Open settings")
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
         }
         .frame(width: 320)
         .background(Color(nsColor: .windowBackgroundColor).opacity(engine.panelOpacity))
         .opacity(engine.panelOpacity)
+        .sheet(isPresented: $showGuide) {
+            GuideView()
+                .preferredColorScheme(.dark)
+        }
     }
 }
 
@@ -1301,6 +1359,71 @@ struct ContentView: View {
     }
 }
 
+struct GuideView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Stay Alive Guide")
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    guideSection("Quick start", """
+1. Click the coffee-cup icon in the menu bar.
+2. Flip On.
+3. Mode: Both (or Display / System only).
+4. Pick a Duration, or Indefinite.
+5. Opacity slider dims the popover if you want it translucent.
+""")
+                    guideSection("Hotkey", "⌃⌥⌘S toggles On/Off from anywhere. Disable under Settings → General.")
+                    guideSection("Right-click menu", "Turn On/Off · Mode · Duration · assertion status · Settings… · Quit")
+                    guideSection("Session lock / logout", """
+Your Mac may lock after a short screensaver idle (~3 min here).
+
+While On, Stay Alive holds sleep assertions and pulses user-activity so idle lock / logout timers reset.
+
+Does not block: manual Log Out, some lid-close sleeps, or MDM force-logout.
+""")
+                    guideSection("Safeguards", "Auto-off on low battery and serious/critical thermal pressure (configurable in Settings).")
+                    guideSection("Automation", "Optional local triggers: processes, AC power, Wi‑Fi SSIDs, calendar events.")
+                    guideSection("Install", "~/Applications/StayAlive.app\nhttps://github.com/pdubbbbbs/StayAlive")
+                    Text("MIT © 2026 Philip S. Wright")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 8)
+                }
+                .padding(16)
+            }
+        }
+        .frame(width: 360, height: 480)
+        .preferredColorScheme(.dark)
+    }
+
+    private func guideSection(_ title: String, _ body: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.orange)
+            Text(body)
+                .font(.system(size: 12))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var engine: StayAliveEngine
 
@@ -1371,9 +1494,13 @@ struct SettingsView: View {
             Section("About") {
                 LabeledContent("Version", value: "2.0")
                 LabeledContent("Bundle", value: "me.philipwright.StayAlive")
+                LabeledContent("Author", value: "Philip S. Wright")
+                LabeledContent("License", value: "MIT")
                 Text("Self-hosted utility. No cloud accounts. philipwright.me")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Link("GitHub: pdubbbbbs/StayAlive", destination: URL(string: "https://github.com/pdubbbbbs/StayAlive")!)
+                    .font(.caption)
             }
         }
         .formStyle(.grouped)
