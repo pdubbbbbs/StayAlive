@@ -1695,7 +1695,7 @@ struct SettingsView: View {
             }
 
             Section("About") {
-                LabeledContent("Version", value: "2.1")
+                LabeledContent("Version", value: "2.2")
                 LabeledContent("Bundle", value: "me.philipwright.StayAlive")
                 LabeledContent("Author", value: "Philip S. Wright")
                 LabeledContent("License", value: "MIT")
