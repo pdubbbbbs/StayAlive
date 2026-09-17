@@ -119,17 +119,25 @@ enum DurationPreset: String, CaseIterable, Identifiable, Codable {
 struct AssertionStatus: Equatable {
     var displayOK: Bool = false
     var systemOK: Bool = false
+    var preventSystemOK: Bool = false
+    var userActivityOK: Bool = false
+    var processActivityOK: Bool = false
     var displayID: IOPMAssertionID = 0
     var systemID: IOPMAssertionID = 0
+    var preventSystemID: IOPMAssertionID = 0
+    var userActivityID: IOPMAssertionID = 0
     var lastError: String?
 
-    var anyActive: Bool { displayOK || systemOK }
+    var anyActive: Bool { displayOK || systemOK || preventSystemOK || userActivityOK || processActivityOK }
 
     var summary: String {
         if let lastError, !anyActive { return lastError }
         var parts: [String] = []
         if displayOK { parts.append("display") }
-        if systemOK { parts.append("system") }
+        if systemOK { parts.append("idle-sleep") }
+        if preventSystemOK { parts.append("system-sleep") }
+        if userActivityOK { parts.append("user-active") }
+        if processActivityOK { parts.append("process") }
         if parts.isEmpty { return "No active assertions" }
         return "Active: " + parts.joined(separator: " + ")
     }
@@ -164,6 +172,8 @@ final class StayAliveEngine: ObservableObject {
         static let panelOpacity = "panelOpacity"
         static let hotkeyEnabled = "hotkeyEnabled"
         static let endDate = "endDate"
+        static let preventScreenLock = "preventScreenLock"
+        static let simulateActivity = "simulateActivity"
     }
 
     // Published state
@@ -231,12 +241,30 @@ final class StayAliveEngine: ObservableObject {
             }
         }
     }
+    /// Keep session unlocked by declaring user activity + stronger sleep assertions.
+    @Published var preventScreenLock: Bool = true {
+        didSet {
+            defaults.set(preventScreenLock, forKey: Key.preventScreenLock)
+            if isOn {
+                releaseAssertions()
+                _ = acquireAssertions()
+            }
+        }
+    }
+    /// Periodically nudge idle timers (IOPM user-activity heartbeat).
+    @Published var simulateActivity: Bool = true {
+        didSet { defaults.set(simulateActivity, forKey: Key.simulateActivity) }
+    }
 
     private var displayAssertionID: IOPMAssertionID = 0
     private var systemAssertionID: IOPMAssertionID = 0
+    private var preventSystemAssertionID: IOPMAssertionID = 0
+    private var userActivityAssertionID: IOPMAssertionID = 0
+    private var processActivity: NSObjectProtocol?
     private var hasAssertion = false
     private var timer: Timer?
     private var pollTimer: Timer?
+    private var activityTimer: Timer?
     private var suppressing = false
     private let eventStore = EKEventStore()
 
@@ -358,14 +386,24 @@ final class StayAliveEngine: ObservableObject {
         let level = IOPMAssertionLevel(kIOPMAssertionLevelOn)
         var status = AssertionStatus()
 
+        // Display: prevent idle display sleep (keeps screen on → blocks screensaver path)
         if mode == .both || mode == .displayOnly {
             var id: IOPMAssertionID = 0
-            let r = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypeNoDisplaySleep as CFString,
+            // Prefer modern PreventUserIdleDisplaySleep name; fall back to NoDisplaySleep
+            var r = IOPMAssertionCreateWithName(
+                "PreventUserIdleDisplaySleep" as CFString,
                 level,
                 reason,
                 &id
             )
+            if r != kIOReturnSuccess {
+                r = IOPMAssertionCreateWithName(
+                    kIOPMAssertionTypeNoDisplaySleep as CFString,
+                    level,
+                    reason,
+                    &id
+                )
+            }
             if r == kIOReturnSuccess {
                 displayAssertionID = id
                 status.displayOK = true
@@ -376,6 +414,7 @@ final class StayAliveEngine: ObservableObject {
             }
         }
 
+        // System idle sleep
         if mode == .both || mode == .systemOnly {
             var id: IOPMAssertionID = 0
             let r = IOPMAssertionCreateWithName(
@@ -389,21 +428,66 @@ final class StayAliveEngine: ObservableObject {
                 status.systemOK = true
                 status.systemID = id
             } else {
-                let msg = "System assertion failed (IOReturn \(r))"
+                let msg = "System idle assertion failed (IOReturn \(r))"
                 status.lastError = status.lastError.map { $0 + "; " + msg } ?? msg
-                log.error("System assertion failed: \(r)")
+                log.error("System idle assertion failed: \(r)")
             }
+
+            // Stronger: PreventSystemSleep (blocks idle sleep more aggressively)
+            var id2: IOPMAssertionID = 0
+            let r2 = IOPMAssertionCreateWithName(
+                "PreventSystemSleep" as CFString,
+                level,
+                reason,
+                &id2
+            )
+            if r2 == kIOReturnSuccess {
+                preventSystemAssertionID = id2
+                status.preventSystemOK = true
+                status.preventSystemID = id2
+            } else {
+                log.warning("PreventSystemSleep failed (optional): \(r2)")
+            }
+        }
+
+        // ProcessInfo activity — AppKit-level idle disable (helps with session idle)
+        var activityOptions: ProcessInfo.ActivityOptions = [
+            .idleSystemSleepDisabled,
+            .suddenTerminationDisabled,
+            .automaticTerminationDisabled
+        ]
+        if mode == .both || mode == .displayOnly {
+            activityOptions.insert(.idleDisplaySleepDisabled)
+        }
+        if preventScreenLock {
+            activityOptions.insert(.userInitiated)
+        }
+        processActivity = ProcessInfo.processInfo.beginActivity(
+            options: activityOptions,
+            reason: "Stay Alive keeps session awake"
+        )
+        status.processActivityOK = (processActivity != nil)
+
+        // Declare user activity once up front (resets idle / lock timers)
+        if preventScreenLock || simulateActivity {
+            pulseUserActivity(into: &status)
         }
 
         assertion = status
         hasAssertion = status.anyActive
         if !hasAssertion {
             lastFailure = status.lastError ?? "No assertion created"
+        } else {
+            startActivityHeartbeat()
+            log.info("Assertions acquired: \(status.summary, privacy: .public)")
         }
         return hasAssertion
     }
 
     private func releaseAssertions() {
+        activityTimer?.invalidate()
+        activityTimer = nil
+
         if displayAssertionID != 0 {
             IOPMAssertionRelease(displayAssertionID)
             displayAssertionID = 0
@@ -412,8 +496,66 @@ final class StayAliveEngine: ObservableObject {
             IOPMAssertionRelease(systemAssertionID)
             systemAssertionID = 0
         }
+        if preventSystemAssertionID != 0 {
+            IOPMAssertionRelease(preventSystemAssertionID)
+            preventSystemAssertionID = 0
+        }
+        if userActivityAssertionID != 0 {
+            IOPMAssertionRelease(userActivityAssertionID)
+            userActivityAssertionID = 0
+        }
+        if let processActivity {
+            ProcessInfo.processInfo.endActivity(processActivity)
+            self.processActivity = nil
+        }
         hasAssertion = false
         assertion = AssertionStatus()
+    }
+
+    /// Reset macOS idle timers so screensaver / lock / auto-logout don't fire.
+    private func pulseUserActivity(into status: inout AssertionStatus) {
+        // Release previous transient user-activity assertion before creating a new one
+        if userActivityAssertionID != 0 {
+            IOPMAssertionRelease(userActivityAssertionID)
+            userActivityAssertionID = 0
+        }
+        var id: IOPMAssertionID = 0
+        // kIOPMUserActiveLocal = 0
+        let r = IOPMAssertionDeclareUserActivity(
+            "Stay Alive user activity" as CFString,
+            IOPMUserActiveType(0),
+            &id
+        )
+        if r == kIOReturnSuccess {
+            userActivityAssertionID = id
+            status.userActivityOK = true
+            status.userActivityID = id
+            assertion.userActivityOK = true
+            assertion.userActivityID = id
+        } else {
+            log.warning("IOPMAssertionDeclareUserActivity failed: \(r)")
+        }
+    }
+
+    private func startActivityHeartbeat() {
+        activityTimer?.invalidate()
+        guard simulateActivity || preventScreenLock else { return }
+        // Screensaver idle is often 60–180s; pulse well under that.
+        activityTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isOn else { return }
+                var status = self.assertion
+                self.pulseUserActivity(into: &status)
+                self.assertion = status
+            }
+        }
+        // Also fire once shortly after enable
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.isOn else { return }
+            var status = self.assertion
+            self.pulseUserActivity(into: &status)
+            self.assertion = status
+        }
     }
 
     // MARK: Timer / remaining
@@ -494,6 +636,13 @@ final class StayAliveEngine: ObservableObject {
         // Triggers only engage when not already user-on, or re-evaluate auto
         evaluateTriggers()
         verifyAssertionsStillHeld()
+
+        // Extra idle reset on the 15s poll as well (screensaver is 180s here)
+        if isOn, (simulateActivity || preventScreenLock) {
+            var status = assertion
+            pulseUserActivity(into: &status)
+            assertion = status
+        }
     }
 
     private func safeguardBlockReason() -> String? {
@@ -628,7 +777,7 @@ final class StayAliveEngine: ObservableObject {
         guard isOn, hasAssertion else { return }
         // Re-assert if somehow released (best-effort)
         // IOPM doesn't give easy query per-id without copying properties; re-create if IDs zeroed
-        if displayAssertionID == 0 && systemAssertionID == 0 {
+        if displayAssertionID == 0 && systemAssertionID == 0 && preventSystemAssertionID == 0 && processActivity == nil {
             log.warning("Assertions lost — reacquiring")
             if !acquireAssertions() {
                 setOn(false, reason: nil, userInitiated: false)
@@ -700,6 +849,12 @@ final class StayAliveEngine: ObservableObject {
         }
         if defaults.object(forKey: Key.hotkeyEnabled) != nil {
             hotkeyEnabled = defaults.bool(forKey: Key.hotkeyEnabled)
+        }
+        if defaults.object(forKey: Key.preventScreenLock) != nil {
+            preventScreenLock = defaults.bool(forKey: Key.preventScreenLock)
+        }
+        if defaults.object(forKey: Key.simulateActivity) != nil {
+            simulateActivity = defaults.bool(forKey: Key.simulateActivity)
         }
     }
 
@@ -1115,6 +1270,12 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            if engine.preventScreenLock {
+                Text("Idle lock/logout blocked while On")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.orange.opacity(0.9))
+            }
+
             Text("Hotkey ⌃⌥⌘S · Right-click menu")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
@@ -1148,6 +1309,14 @@ struct SettingsView: View {
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Panel opacity")
+            }
+
+            Section("Session lock / logout") {
+                Toggle("Prevent screen lock & idle logout", isOn: $engine.preventScreenLock)
+                Toggle("Heartbeat: reset idle timers", isOn: $engine.simulateActivity)
+                Text("Your screensaver idle is short (~3 min). Stay Alive declares user activity while On so lock/logout timers do not fire. This cannot block a manual logout or MDM force-logout.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Safeguards") {
