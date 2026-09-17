@@ -3,9 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "StayAlive",
-    platforms: [
-        .macOS(.v13)
-    ],
+    platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
             name: "StayAlive",
@@ -16,8 +14,6 @@ let package = Package(
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("IOKit"),
                 .linkedFramework("Carbon"),
-                .linkedFramework("CoreWLAN"),
-                .linkedFramework("EventKit"),
                 .linkedFramework("ServiceManagement"),
                 .linkedFramework("UserNotifications")
             ]
