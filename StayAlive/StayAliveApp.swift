@@ -287,11 +287,12 @@ final class StayAliveEngine: ObservableObject {
     @Published var calendarTriggerEnabled: Bool = false {
         didSet { defaults.set(calendarTriggerEnabled, forKey: Key.calendarTriggerEnabled) }
     }
-    /// 0.55 ... 1.0 — window/panel alpha (1.0 = fully opaque). NOT "percent transparent".
+    /// 0.0 ... 1.0 — panel *solidity* over frosted glass (1.0 = solid, 0.0 = full glass).
+    /// This is NOT window.alphaValue (that only greys content out).
     @Published var panelOpacity: Double = 1.0 {
         didSet {
-            let clamped = min(1.0, max(0.55, panelOpacity))
-            if clamped != panelOpacity {
+            let clamped = min(1.0, max(0.0, panelOpacity))
+            if abs(clamped - panelOpacity) > 0.0001 {
                 panelOpacity = clamped
                 return
             }
@@ -314,13 +315,15 @@ final class StayAliveEngine: ObservableObject {
 
     var panelOpacityPercent: Int { Int((panelOpacity * 100).rounded()) }
     var panelTransparencyPercent: Int { max(0, 100 - panelOpacityPercent) }
+    /// How solid the fill is over the glass (100% = no desktop bleed-through).
     var opacityLabel: String {
-        if panelOpacity >= 0.99 { return "Opaque (100%)" }
-        return "\(panelOpacityPercent)% opaque · \(panelTransparencyPercent)% transparent"
+        if panelOpacity >= 0.99 { return "Solid (no glass)" }
+        if panelOpacity <= 0.02 { return "Full glass" }
+        return "\(panelOpacityPercent)% solid · \(panelTransparencyPercent)% glass"
     }
 
     func bumpOpacity(_ delta: Double) {
-        panelOpacity = min(1.0, max(0.55, panelOpacity + delta))
+        panelOpacity = min(1.0, max(0.0, panelOpacity + delta))
     }
 
     func bumpZoom(_ delta: Double) {
@@ -955,7 +958,7 @@ final class StayAliveEngine: ObservableObject {
         if let s = defaults.string(forKey: Key.wifiSSIDs) { wifiSSIDsCSV = s }
         calendarTriggerEnabled = defaults.bool(forKey: Key.calendarTriggerEnabled)
         if defaults.object(forKey: Key.panelOpacity) != nil {
-            panelOpacity = min(1.0, max(0.55, defaults.double(forKey: Key.panelOpacity)))
+            panelOpacity = min(1.0, max(0.0, defaults.double(forKey: Key.panelOpacity)))
         }
         if defaults.object(forKey: Key.uiZoom) != nil {
             uiZoom = min(1.6, max(0.8, defaults.double(forKey: Key.uiZoom)))
@@ -1140,21 +1143,34 @@ final class StatusBarController: NSObject {
         if let button = statusItem.button {
             pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+        // Popover window is created on show — clear it so glass can composite
+        DispatchQueue.main.async { [weak self] in
+            self?.prepareClearWindow(pop.contentViewController?.view.window)
+            self?.applyOpacity()
+        }
     }
 
     private func applyOpacity() {
-        // Apply alpha once on the window chrome only — never stack on SwiftUI .opacity()
-        let alpha = CGFloat(engine.panelOpacity)
-        if let win = popover?.contentViewController?.view.window {
-            win.alphaValue = alpha
-            win.backgroundColor = .clear
-            win.isOpaque = alpha >= 0.99
-        }
-        settingsWindow?.alphaValue = alpha
-        guideWindow?.alphaValue = alpha
-        // Menu bar icon stays fully visible
+        // Real transparency = clear non-opaque windows + frosted glass background in SwiftUI.
+        // Do NOT set window.alphaValue from the slider — that only greys the whole UI out.
+        prepareClearWindow(popover?.contentViewController?.view.window)
+        prepareClearWindow(settingsWindow)
+        prepareClearWindow(guideWindow)
         statusItem.button?.alphaValue = 1.0
         applyZoom()
+    }
+
+    private func prepareClearWindow(_ window: NSWindow?) {
+        guard let window else { return }
+        window.alphaValue = 1.0
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        if window.styleMask.contains(.titled) {
+            window.titlebarAppearsTransparent = true
+        }
+        // Ensure dark vibrancy
+        window.appearance = NSAppearance(named: .darkAqua)
     }
 
     private func applyZoom() {
@@ -1296,10 +1312,14 @@ final class StatusBarController: NSObject {
             let host = NSHostingController(rootView: GuideView().preferredColorScheme(.dark))
             let window = NSWindow(contentViewController: host)
             window.title = "Stay Alive Guide"
-            window.styleMask = [.titled, .closable]
+            window.styleMask = [.titled, .closable, .fullSizeContentView]
             window.setContentSize(NSSize(width: 380, height: 520))
             window.center()
             window.isReleasedWhenClosed = false
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.titlebarAppearsTransparent = true
+            window.appearance = NSAppearance(named: .darkAqua)
             guideWindow = window
         }
         applyOpacity()
@@ -1315,10 +1335,14 @@ final class StatusBarController: NSObject {
             let host = NSHostingController(rootView: view)
             let window = NSWindow(contentViewController: host)
             window.title = "Stay Alive Settings"
-            window.styleMask = [.titled, .closable, .miniaturizable]
+            window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
             window.setContentSize(NSSize(width: 440, height: 560))
             window.center()
             window.isReleasedWhenClosed = false
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.titlebarAppearsTransparent = true
+            window.appearance = NSAppearance(named: .darkAqua)
             settingsWindow = window
         }
         applyOpacity()
@@ -1373,6 +1397,52 @@ final class StatusBarController: NSObject {
 
 // MARK: - SwiftUI views
 
+// MARK: - Real frosted-glass panel background
+
+struct VisualEffectBackground: NSViewRepresentable {
+    var material: NSVisualEffectView.Material = .hudWindow
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        view.isEmphasized = true
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 12
+        view.layer?.masksToBounds = true
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        view.isEmphasized = true
+    }
+}
+
+/// `solidity` 0 = full glass (desktop shows through), 1 = solid dark panel.
+struct FrostedPanelBackground: View {
+    var solidity: Double
+
+    var body: some View {
+        let s = min(1.0, max(0.0, solidity))
+        ZStack {
+            // Always-on vibrancy so desktop / windows bleed through when solid fill is low
+            VisualEffectBackground(
+                material: s < 0.35 ? .menu : (s < 0.7 ? .sidebar : .titlebar),
+                blendingMode: .behindWindow
+            )
+            // Soft dark veil for readability in dark mode
+            Color.black.opacity(0.12 + 0.25 * (1.0 - s))
+            // Solid fill ramps up with the slider — this is what "opaque" means
+            Color(nsColor: .windowBackgroundColor).opacity(s)
+        }
+    }
+}
+
 struct PopoverRootView: View {
     @EnvironmentObject private var engine: StayAliveEngine
 
@@ -1384,7 +1454,7 @@ struct PopoverRootView: View {
                 Text("Opacity")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Slider(value: $engine.panelOpacity, in: 0.55...1.0, step: 0.05)
+                Slider(value: $engine.panelOpacity, in: 0.0...1.0, step: 0.05)
                     .controlSize(.small)
                 Text("\(engine.panelOpacityPercent)%")
                     .font(.caption.monospacedDigit())
@@ -1442,8 +1512,8 @@ struct PopoverRootView: View {
             .padding(.bottom, 12)
         }
         .frame(width: 320)
-        // Solid content; window alphaValue handles translucency (no stacked .opacity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(FrostedPanelBackground(solidity: engine.panelOpacity))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .scaleEffect(engine.uiZoom, anchor: .top)
     }
 }
@@ -1592,7 +1662,7 @@ Does not block: manual Log Out, some lid-close sleeps, or MDM force-logout.
         }
         .frame(width: 360, height: 480)
         .preferredColorScheme(.dark)
-        .environmentObject(StayAliveEngine.shared)
+        .background(FrostedPanelBackground(solidity: StayAliveEngine.shared.panelOpacity))
         .scaleEffect(StayAliveEngine.shared.uiZoom, anchor: .top)
     }
 
@@ -1629,8 +1699,8 @@ struct SettingsView: View {
                             .font(.caption)
                             .multilineTextAlignment(.trailing)
                     }
-                    Slider(value: $engine.panelOpacity, in: 0.55...1.0, step: 0.05)
-                    Text("Window alpha only (not stacked on controls). 100% = fully opaque. ⌘[ more transparent · ⌘] more opaque.")
+                    Slider(value: $engine.panelOpacity, in: 0.0...1.0, step: 0.05)
+                    Text("Frosted glass behind a solid fill. 100% = solid panel, 0% = full glass (desktop shows through). ⌘[ more glass · ⌘] more solid.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1695,7 +1765,7 @@ struct SettingsView: View {
             }
 
             Section("About") {
-                LabeledContent("Version", value: "2.2")
+                LabeledContent("Version", value: "2.3")
                 LabeledContent("Bundle", value: "me.philipwright.StayAlive")
                 LabeledContent("Author", value: "Philip S. Wright")
                 LabeledContent("License", value: "MIT")
@@ -1709,7 +1779,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(minWidth: 420, minHeight: 520)
         .padding()
+        .background(FrostedPanelBackground(solidity: engine.panelOpacity))
         .scaleEffect(engine.uiZoom, anchor: .topLeading)
-        // Do NOT apply panelOpacity here — window.alphaValue handles translucency once
     }
 }
