@@ -102,14 +102,22 @@ enum SelfTest {
         if d != 0 { IOPMAssertionRelease(d) }
         if s != 0 { IOPMAssertionRelease(s) }
 
-        // Glass stack unit check
-        let stack = GlassStack(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
-        stack.setFillOpacity(0.0)
-        check("glass fill 0", abs(Double(stack.fillView.alphaValue) - 0.0) < 0.01, "\(stack.fillView.alphaValue)")
-        stack.setFillOpacity(1.0)
-        check("glass fill 1", abs(Double(stack.fillView.alphaValue) - 1.0) < 0.01, "\(stack.fillView.alphaValue)")
-        stack.setFillOpacity(0.4)
-        check("glass fill 0.4", abs(Double(stack.fillView.alphaValue) - 0.4) < 0.01, "\(stack.fillView.alphaValue)")
+        // Glass unit check
+        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        effect.blendingMode = .behindWindow
+        effect.material = .hudWindow
+        effect.state = .active
+        check("behindWindow", effect.blendingMode == .behindWindow)
+        check("effect active", effect.state == .active)
+        let dim = NSView(frame: effect.bounds)
+        dim.wantsLayer = true
+        dim.layer?.backgroundColor = NSColor.black.cgColor
+        dim.alphaValue = 0
+        check("dim starts clear", abs(Double(dim.alphaValue)) < 0.01)
+        dim.alphaValue = 0.35
+        check("dim soft solid", abs(Double(dim.alphaValue) - 0.35) < 0.01)
+        dim.alphaValue = 0
+        check("dim back to glass", abs(Double(dim.alphaValue)) < 0.01)
 
         if fails == 0 {
             print("StayAlive self-test PASSED")
@@ -120,88 +128,19 @@ enum SelfTest {
     }
 }
 
-// MARK: - Real glass stack (slider MUST visibly change this)
+// MARK: - Real glass stack
+//
+// Working pattern used by menu-bar apps:
+//   panel.isOpaque = false
+//   panel.backgroundColor = .clear
+//   panel.contentView = NSVisualEffectView (behindWindow)   ← MUST be contentView
+//   hosting subview of the effect view with allowsVibrancy
+//
+// Black-card bug was: opaque host + black veil covering the effect.
 
-/// Bottom → top:
-/// 1) NSVisualEffectView (.behindWindow) — desktop bleeds through
-/// 2) clear SwiftUI host — controls
-/// 3) PassThroughFill (black) — slider sets alphaValue; hits pass through
-final class PassThroughFill: NSView {
+final class VibrantHostingView<Content: View>: NSHostingView<Content> {
     override var isOpaque: Bool { false }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil } // clicks go to controls under us
-}
-
-final class GlassStack: NSView {
-    let effectView = NSVisualEffectView()
-    let fillView = PassThroughFill()
-    private var contentHost: NSView?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.isOpaque = false
-
-        effectView.frame = bounds
-        effectView.autoresizingMask = [.width, .height]
-        effectView.material = .hudWindow
-        effectView.blendingMode = .behindWindow
-        effectView.state = .active
-        effectView.isEmphasized = true
-        effectView.wantsLayer = true
-        effectView.layer?.cornerRadius = 16
-        effectView.layer?.masksToBounds = true
-        addSubview(effectView)
-
-        // content added later via setContent (middle)
-
-        fillView.frame = bounds
-        fillView.autoresizingMask = [.width, .height]
-        fillView.wantsLayer = true
-        fillView.layer?.backgroundColor = NSColor.black.cgColor
-        fillView.layer?.cornerRadius = 16
-        fillView.layer?.masksToBounds = true
-        fillView.alphaValue = 0.15
-        // TOP of z-order so alpha changes are always visible over UI
-        addSubview(fillView)
-
-        layer?.cornerRadius = 16
-        layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    func setContent(_ view: NSView) {
-        contentHost?.removeFromSuperview()
-        view.frame = bounds
-        view.autoresizingMask = [.width, .height]
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.clear.cgColor
-        view.layer?.isOpaque = false
-        // Insert UNDER the fill so dimming covers content too (visible proof)
-        addSubview(view, positioned: .below, relativeTo: fillView)
-        contentHost = view
-    }
-
-    /// 0 = no dim (max glass), 1 = full black veil (solid look)
-    func setFillOpacity(_ value: CGFloat) {
-        let v = min(1, max(0, value))
-        fillView.alphaValue = v
-        effectView.state = .active
-        effectView.blendingMode = .behindWindow
-        effectView.material = .hudWindow
-        // Force display
-        fillView.needsDisplay = true
-        effectView.needsDisplay = true
-        needsDisplay = true
-        print("[StayAlive glass] fillView.alphaValue = \(v)")
-    }
-}
-
-final class ClearHostingView<Content: View>: NSHostingView<Content> {
-    override var isOpaque: Bool { false }
+    override var allowsVibrancy: Bool { true }
 
     required init(rootView: Content) {
         super.init(rootView: rootView)
@@ -212,6 +151,13 @@ final class ClearHostingView<Content: View>: NSHostingView<Content> {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.isOpaque = false
+        window?.backgroundColor = .clear
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
 
     override func layout() {
         super.layout()
@@ -232,7 +178,7 @@ final class Engine: ObservableObject {
     @Published var endDate: Date?
     @Published var remaining = ""
     /// 0 = glass (see desktop), 1 = solid. Slider in UI is inverted for "Glass amount".
-    @Published var solidFill: Double = 0.15 {
+    @Published var solidFill: Double = 0.0 {
         didSet {
             let c = min(1, max(0, solidFill))
             if abs(c - solidFill) > 0.0001 { solidFill = c; return }
@@ -446,8 +392,9 @@ final class AppController: NSObject, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var menu = NSMenu()
     private var panel: NSPanel?
-    private var stack: GlassStack?
-    private var host: ClearHostingView<AnyView>?
+    private var effectView: NSVisualEffectView?
+    private var dimView: NSView?
+    private var host: VibrantHostingView<AnyView>?
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
 
@@ -507,56 +454,77 @@ final class AppController: NSObject, NSWindowDelegate {
     }
 
     private func buildPanel() {
-        let size = NSSize(width: 360, height: 480)
+        let size = NSSize(width: 360, height: 500)
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
-            styleMask: [.borderless, .fullSizeContentView, .nonactivatingPanel],
+            styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.level = .floating
+        panel.level = .statusBar  // above normal windows so behindWindow samples desktop
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.isMovableByWindowBackground = true
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.appearance = NSAppearance(named: .vibrantDark)
         panel.delegate = self
 
-        let stack = GlassStack(frame: NSRect(origin: .zero, size: size))
+        // CONTENT VIEW = effect view (critical)
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        effect.autoresizingMask = [.width, .height]
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.isEmphasized = true
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 18
+        effect.layer?.masksToBounds = true
+        effect.layer?.borderWidth = 1
+        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
+
+        // Optional soft dim UNDER host (slider), never black card — max 0.35
+        let dim = NSView(frame: effect.bounds)
+        dim.autoresizingMask = [.width, .height]
+        dim.wantsLayer = true
+        dim.layer?.backgroundColor = NSColor.black.cgColor
+        dim.alphaValue = 0
+        effect.addSubview(dim)
+
         let root = AnyView(
             RootView()
                 .environmentObject(engine)
-                .preferredColorScheme(.dark)
+                
         )
-        let host = ClearHostingView(rootView: root)
-        host.frame = stack.bounds
+        let host = VibrantHostingView(rootView: root)
+        host.frame = effect.bounds
         host.autoresizingMask = [.width, .height]
-        stack.setContent(host)
+        effect.addSubview(host)
 
-        panel.contentView = stack
+        panel.contentView = effect
         self.panel = panel
-        self.stack = stack
+        self.effectView = effect
+        self.dimView = dim
         self.host = host
         applyGlass()
     }
 
     private func applyGlass() {
-        let v = CGFloat(engine.solidFill)
-        guard let stack else {
-            print("[StayAlive glass] applyGlass skipped — no stack yet")
-            return
-        }
-        stack.setFillOpacity(v)
-        // Ensure veil stays on top of SwiftUI host
-        stack.addSubview(stack.fillView, positioned: .above, relativeTo: nil)
+        let amount = CGFloat(min(1, max(0, engine.solidFill)))
+        // amount 0 = pure glass; 1 = slightly more solid (still see desktop)
+        dimView?.alphaValue = amount * 0.35
+        effectView?.state = .active
+        effectView?.blendingMode = .behindWindow
+        effectView?.material = .hudWindow
+        effectView?.isHidden = false
         panel?.isOpaque = false
         panel?.backgroundColor = .clear
         panel?.alphaValue = 1.0
+        print("[StayAlive glass] solidFill=\(amount) dimAlpha=\(dimView?.alphaValue ?? -1) blend=behindWindow")
     }
 
     private func positionPanel() {
@@ -596,7 +564,7 @@ final class AppController: NSObject, NSWindowDelegate {
         // Refresh SwiftUI
         if let host {
             host.rootView = AnyView(
-                RootView().environmentObject(engine).preferredColorScheme(.dark)
+                RootView().environmentObject(engine)
             )
         }
         applyGlass()
@@ -753,7 +721,7 @@ struct RootView: View {
                 )
                 .tint(.red)
                 .controlSize(.large)
-                Text("Right = clear glass (desktop). Left = solid black veil.")
+                Text("Full right = pure glass (wallpaper visible). Left = a bit more solid — never a black card.")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.7))
             }
@@ -777,15 +745,15 @@ struct RootView: View {
             Spacer(minLength: 0)
         }
         .padding(22)
-        // CRITICAL: no opaque background — glass stack shows desktop
+        .frame(width: 360, height: 500)
         .background(Color.clear)
-        .frame(width: 360, height: 480)
+        
     }
 
     private var glassLabel: String {
         let g = Int(((1.0 - engine.solidFill) * 100).rounded())
-        if g >= 95 { return "Clear" }
-        if g <= 5 { return "Solid" }
-        return "\(g)% clear"
+        if g >= 95 { return "Full glass" }
+        if g <= 5 { return "More solid" }
+        return "\(g)% glass"
     }
 }
