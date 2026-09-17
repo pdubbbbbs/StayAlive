@@ -998,6 +998,9 @@ final class StatusBarController: NSObject {
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpenSettings, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.openSettings() }
         })
+        observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpenGuide, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.openGuide() }
+        })
 
         // Refresh title every second while on
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -1209,7 +1212,6 @@ final class StatusBarController: NSObject {
 
 struct PopoverRootView: View {
     @EnvironmentObject private var engine: StayAliveEngine
-    @State private var showGuide = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1232,9 +1234,10 @@ struct PopoverRootView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Panel opacity")
 
+            // Guide + Settings on the desktop popover box
             HStack(spacing: 10) {
                 Button {
-                    showGuide = true
+                    NotificationCenter.default.post(name: .stayAliveOpenGuide, object: nil)
                 } label: {
                     Label("Guide", systemImage: "book.fill")
                         .font(.system(size: 12, weight: .semibold))
@@ -1260,10 +1263,6 @@ struct PopoverRootView: View {
         .frame(width: 320)
         .background(Color(nsColor: .windowBackgroundColor).opacity(engine.panelOpacity))
         .opacity(engine.panelOpacity)
-        .sheet(isPresented: $showGuide) {
-            GuideView()
-                .preferredColorScheme(.dark)
-        }
     }
 }
 
@@ -1368,7 +1367,10 @@ struct GuideView: View {
                 Text("Stay Alive Guide")
                     .font(.system(size: 16, weight: .semibold, design: .rounded))
                 Spacer()
-                Button("Done") { dismiss() }
+                Button("Done") {
+                    dismiss()
+                    NSApp.keyWindow?.close()
+                }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(.horizontal, 16)
