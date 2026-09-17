@@ -35,6 +35,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.bootstrap()
         statusController = StatusBarController(engine: engine)
         HotKeyManager.shared.registerDefault(engine: engine)
+        installMainMenu(engine: engine)
+    }
+
+    /// App menu so ⌘+ / ⌘- / ⌘0 work while Settings/Guide windows are focused.
+    private func installMainMenu(engine: StayAliveEngine) {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenuItem.submenu = appMenu
+        appMenu.addItem(withTitle: "About Stay Alive", action: nil, keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit Stay Alive", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        viewItem.submenu = viewMenu
+
+        let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(AppDelegate.menuZoomIn), keyEquivalent: "+")
+        zoomIn.target = self
+        viewMenu.addItem(zoomIn)
+        let zoomInEq = NSMenuItem(title: "Zoom In", action: #selector(AppDelegate.menuZoomIn), keyEquivalent: "=")
+        zoomInEq.target = self
+        zoomInEq.isAlternate = true
+        viewMenu.addItem(zoomInEq)
+        let zoomOut = NSMenuItem(title: "Zoom Out", action: #selector(AppDelegate.menuZoomOut), keyEquivalent: "-")
+        zoomOut.target = self
+        viewMenu.addItem(zoomOut)
+        let zoomReset = NSMenuItem(title: "Actual Size", action: #selector(AppDelegate.menuZoomReset), keyEquivalent: "0")
+        zoomReset.target = self
+        viewMenu.addItem(zoomReset)
+
+        viewMenu.addItem(NSMenuItem.separator())
+        let moreOpaque = NSMenuItem(title: "More Opaque", action: #selector(AppDelegate.menuMoreOpaque), keyEquivalent: "]")
+        moreOpaque.keyEquivalentModifierMask = [.command]
+        moreOpaque.target = self
+        viewMenu.addItem(moreOpaque)
+        let moreClear = NSMenuItem(title: "More Transparent", action: #selector(AppDelegate.menuMoreTransparent), keyEquivalent: "[")
+        moreClear.keyEquivalentModifierMask = [.command]
+        moreClear.target = self
+        viewMenu.addItem(moreClear)
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    @objc func menuZoomIn() {
+        Task { @MainActor in StayAliveEngine.shared.bumpZoom(0.1) }
+    }
+    @objc func menuZoomOut() {
+        Task { @MainActor in StayAliveEngine.shared.bumpZoom(-0.1) }
+    }
+    @objc func menuZoomReset() {
+        Task { @MainActor in StayAliveEngine.shared.uiZoom = 1.0 }
+    }
+    @objc func menuMoreOpaque() {
+        Task { @MainActor in StayAliveEngine.shared.bumpOpacity(0.05) }
+    }
+    @objc func menuMoreTransparent() {
+        Task { @MainActor in StayAliveEngine.shared.bumpOpacity(-0.05) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -170,6 +230,7 @@ final class StayAliveEngine: ObservableObject {
         static let wifiSSIDs = "wifiSSIDs"
         static let calendarTriggerEnabled = "calendarTriggerEnabled"
         static let panelOpacity = "panelOpacity"
+        static let uiZoom = "uiZoom"
         static let hotkeyEnabled = "hotkeyEnabled"
         static let endDate = "endDate"
         static let preventScreenLock = "preventScreenLock"
@@ -226,12 +287,44 @@ final class StayAliveEngine: ObservableObject {
     @Published var calendarTriggerEnabled: Bool = false {
         didSet { defaults.set(calendarTriggerEnabled, forKey: Key.calendarTriggerEnabled) }
     }
-    /// 0.55 ... 1.0 — panel / menu visual opacity
+    /// 0.55 ... 1.0 — window/panel alpha (1.0 = fully opaque). NOT "percent transparent".
     @Published var panelOpacity: Double = 1.0 {
         didSet {
+            let clamped = min(1.0, max(0.55, panelOpacity))
+            if clamped != panelOpacity {
+                panelOpacity = clamped
+                return
+            }
             defaults.set(panelOpacity, forKey: Key.panelOpacity)
             NotificationCenter.default.post(name: .stayAliveOpacityChanged, object: panelOpacity)
         }
+    }
+    /// UI content zoom (Cmd+ / Cmd-). 0.8 ... 1.6
+    @Published var uiZoom: Double = 1.0 {
+        didSet {
+            let clamped = min(1.6, max(0.8, (uiZoom * 20).rounded() / 20))
+            if abs(clamped - uiZoom) > 0.0001 {
+                uiZoom = clamped
+                return
+            }
+            defaults.set(uiZoom, forKey: Key.uiZoom)
+            NotificationCenter.default.post(name: .stayAliveZoomChanged, object: uiZoom)
+        }
+    }
+
+    var panelOpacityPercent: Int { Int((panelOpacity * 100).rounded()) }
+    var panelTransparencyPercent: Int { max(0, 100 - panelOpacityPercent) }
+    var opacityLabel: String {
+        if panelOpacity >= 0.99 { return "Opaque (100%)" }
+        return "\(panelOpacityPercent)% opaque · \(panelTransparencyPercent)% transparent"
+    }
+
+    func bumpOpacity(_ delta: Double) {
+        panelOpacity = min(1.0, max(0.55, panelOpacity + delta))
+    }
+
+    func bumpZoom(_ delta: Double) {
+        uiZoom = min(1.6, max(0.8, uiZoom + delta))
     }
     @Published var hotkeyEnabled: Bool = true {
         didSet {
@@ -864,6 +957,9 @@ final class StayAliveEngine: ObservableObject {
         if defaults.object(forKey: Key.panelOpacity) != nil {
             panelOpacity = min(1.0, max(0.55, defaults.double(forKey: Key.panelOpacity)))
         }
+        if defaults.object(forKey: Key.uiZoom) != nil {
+            uiZoom = min(1.6, max(0.8, defaults.double(forKey: Key.uiZoom)))
+        }
         if defaults.object(forKey: Key.hotkeyEnabled) != nil {
             hotkeyEnabled = defaults.bool(forKey: Key.hotkeyEnabled)
         }
@@ -911,6 +1007,7 @@ final class StayAliveEngine: ObservableObject {
 extension Notification.Name {
     static let stayAliveStateChanged = Notification.Name("stayAliveStateChanged")
     static let stayAliveOpacityChanged = Notification.Name("stayAliveOpacityChanged")
+    static let stayAliveZoomChanged = Notification.Name("stayAliveZoomChanged")
     static let stayAliveOpenSettings = Notification.Name("stayAliveOpenSettings")
     static let stayAliveOpenGuide = Notification.Name("stayAliveOpenGuide")
 }
@@ -995,6 +1092,9 @@ final class StatusBarController: NSObject {
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpacityChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.applyOpacity() }
         })
+        observations.append(NotificationCenter.default.addObserver(forName: .stayAliveZoomChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.applyZoom() }
+        })
         observations.append(NotificationCenter.default.addObserver(forName: .stayAliveOpenSettings, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.openSettings() }
         })
@@ -1043,10 +1143,32 @@ final class StatusBarController: NSObject {
     }
 
     private func applyOpacity() {
+        // Apply alpha once on the window chrome only — never stack on SwiftUI .opacity()
         let alpha = CGFloat(engine.panelOpacity)
-        popover?.contentViewController?.view.window?.alphaValue = alpha
-        // Also tint status bar text opacity slightly when not fully opaque
-        statusItem.button?.alphaValue = alpha < 0.99 ? max(0.75, alpha) : 1.0
+        if let win = popover?.contentViewController?.view.window {
+            win.alphaValue = alpha
+            win.backgroundColor = .clear
+            win.isOpaque = alpha >= 0.99
+        }
+        settingsWindow?.alphaValue = alpha
+        guideWindow?.alphaValue = alpha
+        // Menu bar icon stays fully visible
+        statusItem.button?.alphaValue = 1.0
+        applyZoom()
+    }
+
+    private func applyZoom() {
+        let z = CGFloat(engine.uiZoom)
+        // Scale hosting views; keep frame readable
+        if let v = popover?.contentViewController?.view {
+            v.scaleUnitSquare(to: NSSize(width: z, height: z))
+        }
+        if let v = settingsWindow?.contentView {
+            v.scaleUnitSquare(to: NSSize(width: z, height: z))
+        }
+        if let v = guideWindow?.contentView {
+            v.scaleUnitSquare(to: NSSize(width: z, height: z))
+        }
     }
 
     private func refresh() {
@@ -1123,6 +1245,32 @@ final class StatusBarController: NSObject {
         menu.addItem(settings)
 
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem.separator())
+
+        let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "+")
+        zoomIn.keyEquivalentModifierMask = [.command]
+        zoomIn.target = self
+        menu.addItem(zoomIn)
+
+        // Cmd+= is the unshifted key for + on US keyboards
+        let zoomInEq = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "=")
+        zoomInEq.keyEquivalentModifierMask = [.command]
+        zoomInEq.target = self
+        zoomInEq.isAlternate = true
+        zoomInEq.isHidden = true
+        menu.addItem(zoomInEq)
+
+        let zoomOut = NSMenuItem(title: "Zoom Out", action: #selector(zoomOutAction), keyEquivalent: "-")
+        zoomOut.keyEquivalentModifierMask = [.command]
+        zoomOut.target = self
+        menu.addItem(zoomOut)
+
+        let zoomReset = NSMenuItem(title: "Actual Size", action: #selector(zoomResetAction), keyEquivalent: "0")
+        zoomReset.keyEquivalentModifierMask = [.command]
+        zoomReset.target = self
+        menu.addItem(zoomReset)
+
+        menu.addItem(NSMenuItem.separator())
         let quit = NSMenuItem(title: "Quit Stay Alive", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -1154,7 +1302,7 @@ final class StatusBarController: NSObject {
             window.isReleasedWhenClosed = false
             guideWindow = window
         }
-        guideWindow?.alphaValue = CGFloat(engine.panelOpacity)
+        applyOpacity()
         guideWindow?.makeKeyAndOrderFront(nil)
     }
 
@@ -1173,12 +1321,27 @@ final class StatusBarController: NSObject {
             window.isReleasedWhenClosed = false
             settingsWindow = window
         }
-        settingsWindow?.alphaValue = CGFloat(engine.panelOpacity)
+        applyOpacity()
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func zoomInAction() {
+        engine.bumpZoom(0.1)
+        applyZoom()
+    }
+
+    @objc private func zoomOutAction() {
+        engine.bumpZoom(-0.1)
+        applyZoom()
+    }
+
+    @objc private func zoomResetAction() {
+        engine.uiZoom = 1.0
+        applyZoom()
     }
 
     private static func makeIcon(active: Bool) -> NSImage {
@@ -1223,16 +1386,34 @@ struct PopoverRootView: View {
                     .foregroundStyle(.secondary)
                 Slider(value: $engine.panelOpacity, in: 0.55...1.0, step: 0.05)
                     .controlSize(.small)
-                Text("\(Int(engine.panelOpacity * 100))%")
+                Text("\(engine.panelOpacityPercent)%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 36, alignment: .trailing)
+                    .help(engine.opacityLabel)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Panel opacity")
+            .accessibilityValue(engine.opacityLabel)
+
+            HStack {
+                Text("Zoom")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
+                    .controlSize(.small)
+                Text("\(Int((engine.uiZoom * 100).rounded()))%")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 36, alignment: .trailing)
             }
             .padding(.horizontal, 16)
-            .padding(.top, 10)
             .padding(.bottom, 6)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Panel opacity")
+            .accessibilityLabel("UI zoom")
+            .help("⌘+ zoom in · ⌘- zoom out · ⌘0 reset")
 
             // Guide + Settings on the desktop popover box
             HStack(spacing: 10) {
@@ -1261,8 +1442,9 @@ struct PopoverRootView: View {
             .padding(.bottom, 12)
         }
         .frame(width: 320)
-        .background(Color(nsColor: .windowBackgroundColor).opacity(engine.panelOpacity))
-        .opacity(engine.panelOpacity)
+        // Solid content; window alphaValue handles translucency (no stacked .opacity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .scaleEffect(engine.uiZoom, anchor: .top)
     }
 }
 
@@ -1410,6 +1592,8 @@ Does not block: manual Log Out, some lid-close sleeps, or MDM force-logout.
         }
         .frame(width: 360, height: 480)
         .preferredColorScheme(.dark)
+        .environmentObject(StayAliveEngine.shared)
+        .scaleEffect(StayAliveEngine.shared.uiZoom, anchor: .top)
     }
 
     private func guideSection(_ title: String, _ body: String) -> some View {
@@ -1440,17 +1624,34 @@ struct SettingsView: View {
                     HStack {
                         Text("Panel opacity")
                         Spacer()
-                        Text(engine.panelOpacity >= 0.99 ? "Opaque" : "\(Int(engine.panelOpacity * 100))% transparent")
+                        Text(engine.opacityLabel)
                             .foregroundStyle(.secondary)
                             .font(.caption)
+                            .multilineTextAlignment(.trailing)
                     }
                     Slider(value: $engine.panelOpacity, in: 0.55...1.0, step: 0.05)
-                    Text("Controls popover, settings window, and menu bar dimming. 100% is fully opaque.")
+                    Text("Window alpha only (not stacked on controls). 100% = fully opaque. ⌘[ more transparent · ⌘] more opaque.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Panel opacity")
+                .accessibilityValue(engine.opacityLabel)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("UI zoom")
+                        Spacer()
+                        Text("\(Int((engine.uiZoom * 100).rounded()))%")
+                            .foregroundStyle(.secondary)
+                            .font(.caption.monospacedDigit())
+                    }
+                    Slider(value: $engine.uiZoom, in: 0.8...1.6, step: 0.1)
+                    Text("⌘+ zoom in · ⌘- zoom out · ⌘0 actual size")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .accessibilityLabel("UI zoom")
             }
 
             Section("Session lock / logout") {
@@ -1508,6 +1709,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(minWidth: 420, minHeight: 520)
         .padding()
-        .opacity(engine.panelOpacity)
+        .scaleEffect(engine.uiZoom, anchor: .topLeading)
+        // Do NOT apply panelOpacity here — window.alphaValue handles translucency once
     }
 }
